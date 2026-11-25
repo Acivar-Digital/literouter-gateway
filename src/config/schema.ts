@@ -51,7 +51,7 @@ export const RateLimitSchema = z.object({
   tpm: z.number().int().nonnegative(),
 });
 
-export const ProviderEndpointsSchema = z.record(
+export const ProviderEndpointsSchema = z.partialRecord(
   CompletionCodeSchema,
   z.string().min(1)
 );

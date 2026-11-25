@@ -22,7 +22,7 @@ describe("Strict Provider Schema Tamper & Fail-Loud Tests", () => {
       const hasMissingPacer = result.error.issues.some(
         (issue) =>
           issue.path.join(".") === "providers.openrouter.pacer" &&
-          issue.message === "Required"
+          issue.code === "invalid_type"
       );
       expect(hasMissingPacer).toBe(true);
     }
@@ -58,7 +58,7 @@ describe("Strict Provider Schema Tamper & Fail-Loud Tests", () => {
       const hasMissingRetry = result.error.issues.some(
         (issue) =>
           issue.path.join(".") === "providers.zen.request_retry" &&
-          issue.message === "Required"
+          issue.code === "invalid_type"
       );
       expect(hasMissingRetry).toBe(true);
     }
@@ -76,7 +76,7 @@ describe("Strict Provider Schema Tamper & Fail-Loud Tests", () => {
       const hasMissingEnvKey = result.error.issues.some(
         (issue) =>
           issue.path.join(".") === "providers.gcp.env_key" &&
-          issue.message === "Required"
+          issue.code === "invalid_type"
       );
       expect(hasMissingEnvKey).toBe(true);
     }
@@ -94,7 +94,7 @@ describe("Strict Provider Schema Tamper & Fail-Loud Tests", () => {
       const hasMissingMinDelay = result.error.issues.some(
         (issue) =>
           issue.path.join(".") === "providers.openrouter.pacer.min_delay_ms" &&
-          issue.message === "Required"
+          issue.code === "invalid_type"
       );
       expect(hasMissingMinDelay).toBe(true);
     }
@@ -112,7 +112,7 @@ describe("Strict Provider Schema Tamper & Fail-Loud Tests", () => {
       const hasMissingAttempts = result.error.issues.some(
         (issue) =>
           issue.path.join(".") === "providers.nvidia.request_retry.max_attempts" &&
-          issue.message === "Required"
+          issue.code === "invalid_type"
       );
       expect(hasMissingAttempts).toBe(true);
     }

@@ -123,7 +123,10 @@ describe("Batch1 Regression — strategy / probe-cap / TTFT / auth-negative", ()
     const parsed = ProvidersConfigSchema.safeParse(bad);
     expect(parsed.success).toBe(false);
     if (!parsed.success) {
-      expect(JSON.stringify(parsed.error.issues)).toContain("bogus_strat_xyz");
+      const strategyIssue = parsed.error.issues.find(
+        (issue) => issue.path.join(".") === "providers.bogus.strategy"
+      );
+      expect(strategyIssue).toBeDefined();
     }
 
     // Boundary 2: every schema-admissible strategy resolves to a factory, so
