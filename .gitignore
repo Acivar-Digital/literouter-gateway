@@ -1,0 +1,43 @@
+# Dependencies & Build
+node_modules/
+dist/
+build/
+.bun/
+
+# Secrets & Local Environment (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+certs/
+
+# Local Config Overrides
+config/location.json
+config/providers.json
+config/models.json
+fusion.json
+
+# Runtime Logs, Databases & Caches
+logs/
+*.log
+*.db
+*.sqlite*
+.pytest_cache/
+__pycache__/
+.venv/
+
+# Agent / Ops Workspace Artifacts
+.beads/
+.opencode/
+.omp/
+.claude/
+.cursor/
+.codex/
+scratch/
+graphify-out/
+repomix.md
+
+# OS
+.DS_Store
+Thumbs.db
