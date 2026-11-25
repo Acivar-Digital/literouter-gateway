@@ -1,42 +1,18 @@
 # LiteRouter Gateway
 
-> A fast, single-runtime-dependency LLM API gateway and resilient multi-provider
-> proxy built on **Bun + TypeScript**. One declarative API key routes, paces,
-> translates, and fails over across OpenAI, Anthropic, Google, NVIDIA, and
-> self-hosted embedding backends — with no client SDK required.
+> Enterprise-grade LLM gateway resilience, scaled down to a solo-developer footprint: **1 Bun process, 1 runtime dependency (`zod`), zero Redis/Docker/Postgres.**
 
-LiteRouter sits between any OpenAI-/Anthropic-/Google-shaped client and a pool of
-upstream providers. The client's API key *is* the routing directive: a compact,
-human-readable token selects the provider, wire dialect, endpoint, and behavioral
-nuances. Behind that token the gateway enforces a single outbound pacing pipe,
-reactive per-key cooldowns, session-sticky KV-cache pinning, multi-tier fusion
-fallback, and cross-wire payload translation.
+Most LLM proxies sit at one of two extremes: heavyweight multi-service stacks built for large platform teams, or thin round-robin wrappers that break under real traffic. **LiteRouter** brings production fault tolerance—provider-specific retry state machines, single-pipe pacing, verified quota conservation, session-sticky LRU KV-cache pinning, and cross-wire translation—into a single-process TypeScript gateway **battle-tested in daily use for over a year**.
 
 ---
 
-## Engineering Highlights
+## Design Decisions That Matter in Production
 
-- **One runtime dependency (`zod`).** Everything else is Bun and the standard
-  library. Fast cold start, small surface, no transitive dependency churn.
-- **Declarative directive routing.** The API key encodes intent as
-  `lr-<provider>-<wire>-<endpoint>-<nuance>` (e.g. `lr-or-oa-ch-no`), parsed
-  against closed code sets — no client-side configuration to drift.
-- **Single-pipe `RequestPacer`.** All keys for a provider share one FIFO pacing
-  pipe with jitter and a bounded queue, shaping *outbound* timing so a burst of
-  keys cannot stampede an upstream.
-- **Reactive `CooldownManager`.** Per-key quarantine TTLs derived from HTTP
-  status and `Retry-After`, with verified-quota conservation so generic `429`s
-  rotate keys without benching accounts (no self-DoS).
-- **Session-sticky LRU KV-cache pinning.** Inbound session IDs (`session_id`,
-  `prompt_cache_key`) pin a key with true LRU eviction (`delete`-then-`set`),
-  preserving upstream prompt-cache locality instead of destroying it with
-  stateless round-robin.
-- **Multi-tier `FusionEngine`.** Ordered provider tiers per `preset:model` with a
-  sticky last-successful-tier cache, so a model that only works on a fallback
-  tier is attempted there first next time.
-- **Cross-wire translation.** A `PayloadTransformerContract` translates between
-  OpenAI Chat, Anthropic Messages, and Google dialects in both directions,
-  including streaming SSE reconstruction and in-band error forwarding.
+- **Zero-SDK steering via directive-encoded API keys.** Instead of forcing custom `X-*` headers or server-side virtual-key tables, the bearer token itself encodes routing intent as `lr-<provider>-<wire>-<endpoint>-<nuance>` (e.g. `lr-or-oa-ch-no`), with optional caller-hash suffixes for attribution. `body.model` stays untouched and upstream-native, while admin/trace routes remain strictly isolated behind constant-time `LITEROUTER_AUTH_KEY` (`timingSafeEqual`) verification.
+- **Provider-specific failure semantics (not a global `retry(3)`).** Upstream providers fail differently: `403` billing guardrails fail fast, generic `429`s rotate keys without benching accounts (preventing self-DoS), verified quota depletion triggers `CooldownManager` conservation via single-flight probe (`openrouter_probe.ts`), `502`/`504` transport drops use bounded grace retries, and multi-tier `FusionEngine` cascades across providers.
+- **KV-cache locality over naive round-robin.** Stateless round-robin destroys prompt-cache hit rates on providers that scope caches per key. Inbound session IDs (`session_id`, `prompt_cache_key`, headers) pin a key with true LRU eviction (`delete`-then-`set`), breaking the pin only on `402`/`429` rotation.
+- **Single-pipe `RequestPacer` + bounded footprint.** All keys for a provider share one FIFO pacing pipe with jitter and a bounded queue so bursts cannot stampede an upstream, backed by a single runtime dependency (`zod`) and fast cold start.
+- **Cross-wire translation & SSE stream resilience.** `PayloadTransformerContract` translates between OpenAI Chat/Responses, Anthropic Messages, and Google dialects in both directions, including HTTP/2-to-HTTP/1.1 fallback (`fetchWithTtftGuard`) and mid-stream in-band error forwarding.
 
 ---
 
