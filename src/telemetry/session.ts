@@ -1,0 +1,338 @@
+import { getProviderDisplayName } from "../config/providers";
+import {
+  EMOJI,
+  deriveErrorType,
+  formatTimestamp,
+  formatTokenNumber,
+  getHttpStatusText,
+  logInbound,
+  logModel,
+} from "../ui/logger";
+import { type MetricsHook, noopMetrics } from "./hooks";
+
+export interface SessionData {
+  readonly reqId: string;
+  readonly method: string;
+  readonly path: string;
+  readonly clientAgent: string;
+  readonly protocol?: string;
+  readonly directiveStr?: string;
+  readonly targetProvider?: string;
+  readonly wireFormat?: string;
+  readonly endpoint?: string;
+  readonly model?: string;
+  resolvedModel?: string;
+  tier?: number;
+  readonly keyIndex?: number;
+  readonly totalKeys?: number;
+  readonly nuances?: readonly string[];
+  readonly referrer?: string;
+  readonly metricsHook?: MetricsHook;
+}
+
+export interface TelemetryInit extends SessionData {}
+
+export interface UsageRecord {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly reasoningTokens?: number;
+  readonly cachedTokens?: number;
+  readonly cacheWriteTokens?: number;
+  readonly cacheDiscount?: number;
+  readonly totalTokens?: number;
+  readonly finishReason?: string | null;
+}
+
+export interface RotateKeyInfo {
+  readonly fromIndex: number;
+  readonly toIndex: number;
+  readonly totalKeys?: number;
+  readonly attempt?: number;
+  readonly maxAttempts?: number;
+}
+
+export interface RecordLimitInfo {
+  readonly status: number;
+  readonly retryAfterSec?: number;
+  readonly totalKeys?: number;
+  readonly rawMessage?: string;
+  readonly hasUpstreamRetryAfter?: boolean;
+  readonly errorType?: string;
+  readonly remainingTokens?: number;
+  readonly remainingRequests?: number;
+}
+
+export interface TraceMetrics {
+  readonly reqId: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly durationMs: number;
+  readonly ttftMs?: number;
+  readonly promptTokens?: number;
+  readonly completionTokens?: number;
+  readonly cachedTokens?: number;
+  readonly cacheWriteTokens?: number;
+  readonly cacheDiscount?: number;
+  readonly totalTokens?: number;
+}
+
+function buildSpeedString(durationMs: number, completionTokens: number): string {
+  if (durationMs <= 0 || completionTokens <= 0) {
+    return "";
+  }
+  const sec = durationMs / 1000;
+  const speed = (completionTokens / sec).toFixed(1);
+  return ` | Speed=${speed} tok/s`;
+}
+
+function formatCacheMetric(label: string, value: number | undefined): string {
+  if (value === undefined || value <= 0) {
+    return "";
+  }
+  return ` | ${label}=${formatTokenNumber(value)}`;
+}
+
+function buildCacheStrings(record: UsageRecord): string {
+  const cachedStr = formatCacheMetric("Cached", record.cachedTokens);
+  const cacheWriteStr = formatCacheMetric("CacheWrite", record.cacheWriteTokens);
+  const discountStr = record.cacheDiscount !== undefined && record.cacheDiscount > 0
+    ? ` | Discount=${record.cacheDiscount}`
+    : "";
+  return `${cachedStr}${cacheWriteStr}${discountStr}`;
+}
+
+export class RequestTelemetry {
+  private readonly startTime: number = performance.now();
+  private firstTokenTime?: number;
+  public readonly reqId: string;
+  private readonly providerCode: string;
+  private currentKeyIndex?: number;
+  private totalKeys?: number;
+  private pinnedSessionId?: string;
+  private readonly metrics: MetricsHook;
+  private lastUsage?: UsageRecord;
+  private status?: number;
+  public readonly session: SessionData;
+
+  constructor(private readonly init: TelemetryInit) {
+    this.session = { ...init };
+    this.reqId = init.reqId;
+    this.providerCode = init.targetProvider ?? "unknown";
+    this.currentKeyIndex = init.keyIndex;
+    this.totalKeys = init.totalKeys;
+    this.metrics = init.metricsHook ?? noopMetrics;
+  }
+
+  // ── Lifecycle Methods ──
+
+  /** Update resolved model target and tier. */
+  setResolvedTarget(model?: string, tier?: number): void {
+    this.session.resolvedModel = model;
+    this.session.tier = tier;
+  }
+
+  /** Record resolved session ID for terminal pin/rr observability. */
+  setSessionPin(sessionId?: string): void {
+    this.pinnedSessionId = sessionId;
+  }
+
+  /** Emits resolved model banner if strategy resolution happened post-inbound. */
+  emitResolvedModel(): void {
+    logModel(
+      this.reqId,
+      this.session.model ?? "unknown",
+      this.session.resolvedModel,
+      this.session.tier
+    );
+  }
+
+  /** Called once at request receipt. Emits inbound banner. */
+  emitInbound(): void {
+    logInbound({
+      reqId: this.session.reqId,
+      method: this.session.method,
+      path: this.session.path,
+      clientAgent: this.session.clientAgent,
+      protocol: this.session.protocol,
+      directiveStr: this.session.directiveStr,
+      targetProvider: this.session.targetProvider,
+      wireFormat: this.session.wireFormat,
+      endpoint: this.session.endpoint,
+      model: this.session.model,
+      resolvedModel: this.session.resolvedModel,
+      tier: this.session.tier,
+      keyIndex: this.currentKeyIndex !== undefined && this.currentKeyIndex >= 0 ? this.currentKeyIndex : undefined,
+      totalKeys: this.totalKeys,
+      nuances: this.session.nuances,
+      referrer: this.session.referrer,
+    });
+
+    this.metrics.onRequestStart(this.reqId, this.providerCode, this.session.model ?? "unknown");
+  }
+
+  /** Update key index and optionally total keys count. */
+  setKeyIndex(index: number, totalKeys?: number): void {
+    this.currentKeyIndex = index;
+    if (totalKeys !== undefined) {
+      this.totalKeys = totalKeys;
+    }
+  }
+
+  /** Called on key rotation. Updates internal key index. */
+  rotateKey(info: RotateKeyInfo): void {
+    if (info.toIndex >= 0) {
+      this.currentKeyIndex = info.toIndex;
+    }
+    if (info.totalKeys !== undefined) {
+      this.totalKeys = info.totalKeys;
+    }
+
+    const ts = formatTimestamp();
+    const provName = getProviderDisplayName(this.providerCode);
+    const total = info.totalKeys ?? this.totalKeys;
+    const totalStr = total !== undefined ? `/${total}` : "";
+    const attemptStr = info.attempt && info.maxAttempts ? ` (Attempt ${info.attempt}/${info.maxAttempts})` : "";
+    const keyStr = info.toIndex >= 0 ? ` [Key #${info.toIndex + 1}${totalStr}] ` : " ";
+    console.log(`${EMOJI.rotate} ${ts} [ROTATE ${this.reqId}] Advancing to ${provName}${keyStr}-> Retrying immediately${attemptStr}`);
+
+    this.metrics.onKeyRotation(this.reqId, this.providerCode, info.fromIndex, info.toIndex);
+  }
+
+  /** Called on upstream rate limit or quota. */
+  recordLimit(info: RecordLimitInfo): void {
+    const ts = formatTimestamp();
+    const provName = getProviderDisplayName(this.providerCode);
+    const keyIdx = this.currentKeyIndex !== undefined && this.currentKeyIndex >= 0 ? this.currentKeyIndex : 0;
+    const total = info.totalKeys ?? this.totalKeys;
+    const keyTotal = total !== undefined ? `/${total}` : "";
+    const statusText = getHttpStatusText(info.status);
+    const condensedType = info.errorType ?? deriveErrorType(info.rawMessage, info.status);
+
+    console.warn(`${EMOJI.limit} ${ts} [LIMIT ${this.reqId}] ${provName} [Key #${keyIdx + 1}${keyTotal}] returned ${statusText} [${condensedType} ${info.status}]`);
+    if (info.retryAfterSec && info.hasUpstreamRetryAfter !== false) {
+      console.warn(`${EMOJI.limit} ${ts} [LIMIT ${this.reqId}] Parsed Retry-After: ${info.retryAfterSec}s -> Quarantined Key #${keyIdx + 1} for ${info.retryAfterSec}s`);
+    }
+    if (info.remainingTokens !== undefined || info.remainingRequests !== undefined) {
+      console.warn(`${EMOJI.limit} ${ts} [LIMIT ${this.reqId}] Remaining Quota: ${info.remainingTokens !== undefined ? `${info.remainingTokens} tokens` : "unknown"}, ${info.remainingRequests !== undefined ? `${info.remainingRequests} reqs` : "unknown"}`);
+    }
+    if (info.rawMessage) {
+      console.warn(`${EMOJI.limit} ${ts} [LIMIT ${this.reqId}] Upstream Error: "${info.rawMessage.slice(0, 300)}"`);
+    }
+  }
+
+  /** Called on first SSE chunk received. Idempotent (ignores subsequent calls). */
+  markTtft(protocol?: string, details = "First chunk streamed downstream"): void {
+    if (this.firstTokenTime !== undefined) {
+      return;
+    }
+    this.firstTokenTime = performance.now();
+    const ttftMs = this.getTtftMs() ?? 0;
+    const ts = formatTimestamp();
+    const protoStr = protocol ? ` [Upstream: ${protocol}]` : "";
+    console.log(`${EMOJI.ttft} ${ts} [TTFT ${this.reqId}] TTFT = ${ttftMs}ms | ${details}${protoStr}`);
+  }
+
+  /** Called when tokens are extracted from response. Computes speed, emits usage. */
+  recordUsage(record: UsageRecord): void {
+    this.lastUsage = record;
+    const ts = formatTimestamp();
+    const provName = getProviderDisplayName(this.providerCode);
+    const keyIdx = this.currentKeyIndex !== undefined && this.currentKeyIndex >= 0 ? this.currentKeyIndex + 1 : 1;
+    const totalKeysStr = this.totalKeys !== undefined ? `/${this.totalKeys}` : "";
+
+    const durationMs = this.getDurationMs();
+    const speedStr = buildSpeedString(durationMs, record.completionTokens);
+
+    const reasoningStr = record.reasoningTokens && record.reasoningTokens > 0
+      ? ` | Reasoning=${formatTokenNumber(record.reasoningTokens)}`
+      : "";
+
+    const totalTokens = record.totalTokens ?? (record.promptTokens + record.completionTokens);
+    const cacheStr = buildCacheStrings(record);
+
+    const pinStr = this.pinnedSessionId ? ` | pin:${this.pinnedSessionId.slice(0, 8)}` : " | rr";
+    console.log(`${EMOJI.usage} ${ts} [USAGE ${this.reqId}] ${provName} (Key #${keyIdx}${totalKeysStr}${pinStr})`);
+    console.log(
+      `${EMOJI.tokens} ${ts} [USAGE ${this.reqId}] Tokens: Prompt=${formatTokenNumber(record.promptTokens)}${reasoningStr} | Completion=${formatTokenNumber(record.completionTokens)} | Total=${formatTokenNumber(totalTokens)}${speedStr}${cacheStr}`
+    );
+
+    if (record.finishReason === "length") {
+      console.warn(`${EMOJI.finishTrunc} ${ts} [FINISH ${this.reqId}] Upstream token truncation occurred (finish_reason=length)`);
+    }
+  }
+
+  /** Called at response completion. Emits served banner with total duration. */
+  served(status = 200, attempt?: number, maxAttempts?: number): void {
+    this.status = status;
+    const durationMs = this.getDurationMs();
+    const ts = formatTimestamp();
+    const attemptStr = attempt && maxAttempts && maxAttempts > 1 ? ` (attempt ${attempt}/${maxAttempts})` : "";
+    const icon = status >= 400 ? EMOJI.servedErr : EMOJI.servedOk;
+
+    if (status >= 400) {
+      console.warn(`${icon} ${ts} [SERVED ${this.reqId}] HTTP ${status} in ${durationMs}ms${attemptStr}`);
+    } else {
+      console.log(`${icon} ${ts} [SERVED ${this.reqId}] HTTP ${status} in ${durationMs}ms${attemptStr}`);
+    }
+
+    this.metrics.onRequestEnd(this.reqId, status, durationMs, this.getTtftMs());
+  }
+
+  /** Called on error. */
+  error(message: string, err?: unknown): void {
+    this.status = 500;
+    const durationMs = this.getDurationMs();
+    const errDetail = err instanceof Error ? ` - ${err.message}` : "";
+    console.error(`${EMOJI.error} ${formatTimestamp()} [ERROR ${this.reqId}] ${message}${errDetail}`);
+    this.metrics.onRequestEnd(this.reqId, 500, durationMs, this.getTtftMs());
+  }
+
+  /**
+   * Logs an upstream error observed INSIDE an already-serving response stream.
+   *
+   * Deliberately side-effect free on `status` and on `metrics.onRequestEnd`:
+   * the streaming dispatch path has already called `served(200)` before the
+   * body is handed to the client, so routing through `error()` would both
+   * corrupt the recorded status to 500 and fire `onRequestEnd` twice. An
+   * in-band upstream error is otherwise completely invisible: the client
+   * receives an `event: error` frame over a 200 response, no TTFT line is
+   * emitted, and the request counts as a success in traces.db.
+   */
+  upstreamStreamError(message: string): void {
+    const ts = formatTimestamp();
+    console.warn(`${EMOJI.limit} ${ts} [STREAM ${this.reqId}] ${message}`);
+  }
+
+  // ── Derived Metrics ──
+
+  /** Returns TTFT in ms, or undefined if no first token received. */
+  getTtftMs(): number | undefined {
+    return this.firstTokenTime !== undefined
+      ? Math.round(this.firstTokenTime - this.startTime)
+      : undefined;
+  }
+
+  /** Returns total request duration in ms. */
+  getDurationMs(): number {
+    return Math.round(performance.now() - this.startTime);
+  }
+
+  /** Returns structured snapshot for trace storage. */
+  toTraceMetrics(): TraceMetrics {
+    return {
+      reqId: this.reqId,
+      provider: this.providerCode,
+      model: this.session.model ?? "unknown",
+      durationMs: this.getDurationMs(),
+      ttftMs: this.getTtftMs(),
+      ...(this.lastUsage ? {
+        promptTokens: this.lastUsage.promptTokens,
+        completionTokens: this.lastUsage.completionTokens,
+        ...(this.lastUsage.cachedTokens !== undefined ? { cachedTokens: this.lastUsage.cachedTokens } : {}),
+        ...(this.lastUsage.cacheWriteTokens !== undefined ? { cacheWriteTokens: this.lastUsage.cacheWriteTokens } : {}),
+        ...(this.lastUsage.cacheDiscount !== undefined ? { cacheDiscount: this.lastUsage.cacheDiscount } : {}),
+        totalTokens: this.lastUsage.totalTokens ?? (this.lastUsage.promptTokens + this.lastUsage.completionTokens),
+      } : {}),
+    };
+  }
+}

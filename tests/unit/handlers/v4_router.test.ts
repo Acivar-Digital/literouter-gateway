@@ -1,0 +1,429 @@
+import { describe, expect, it, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { dispatchV4, findTraceInDb } from "../../../src/handlers/v4/router";
+import { traceBuffer, type SanitizedTrace } from "../../../src/telemetry/ring_buffer";
+import { TraceWriter, traceWriter } from "../../../src/telemetry/trace_writer";
+import { initProviderRegistry } from "../../../src/config/providers";
+import { initStrategyRegistry } from "../../../src/engine/strategy_registry";
+import { resetEnvCache } from "../../../src/config/env";
+
+function createMockTrace(reqId: string, status = 200): SanitizedTrace {
+  return {
+    reqId,
+    createdAt: Date.now(),
+    provider: "openrouter",
+    model: "test-model",
+    status,
+    durationMs: 120,
+    ttftMs: 45,
+    tokensPrompt: 10,
+    tokensCompletion: 20,
+    legs: {
+      clientInbound: '{"prompt":"hello"}',
+      upstreamOutbound: '{"model":"test-model"}',
+      upstreamInbound: '{"choices":[]}',
+      clientOutbound: '{"result":"ok"}',
+    },
+  };
+}
+
+describe("v4 router dispatcher", () => {
+  beforeEach(() => {
+    initProviderRegistry();
+    initStrategyRegistry();
+    traceBuffer.clear();
+  });
+
+  afterEach(() => {
+    traceBuffer.clear();
+    traceWriter.drainSync();
+  });
+
+  describe("thin handler routing", () => {
+    it("dispatches POST /v1/chat/completions to openai_chat handler", async () => {
+      const paths = [
+        "/v1/chat/completions",
+        "/chat/completions",
+        "/api/v1/chat/completions",
+        "/v1/chat/completions/chat/completions",
+        "/v1/chat/completions/",
+      ];
+      for (const p of paths) {
+        const req = new Request(`http://localhost:7766${p}`, {
+          method: "POST",
+          body: "{malformed-json",
+        });
+        const res = await dispatchV4(req, "lr-or-oa-ch-no", "req-chat-1");
+        expect(res.status).toBe(400);
+        const json = await res.json();
+        expect(json.error.message).toContain("Invalid JSON");
+      }
+    });
+
+    it("dispatches POST /v1/messages and aliases to anthropic_messages handler", async () => {
+      const paths = [
+        "/v1/messages",
+        "/messages",
+        "/api/v1/messages",
+        "/v1/messages/messages",
+        "/messages/messages",
+        "/v1/message",
+        "/message",
+        "/api/v1/message",
+        "/v1/message/message",
+        "/message/message",
+        "/v1/messages/message",
+        "/v1/message/messages",
+        "/messages/message",
+        "/message/messages",
+      ];
+      for (const p of paths) {
+        const req = new Request(`http://localhost:7766${p}`, {
+          method: "POST",
+          body: "{malformed-json",
+        });
+        const res = await dispatchV4(req, "lr-an-cl-ms-no", "req-msg-alias");
+        expect(res.status).toBe(400);
+      }
+    });
+
+    it("dispatches POST /v1/responses to openai_responses handler", async () => {
+      const paths = [
+        "/v1/responses",
+        "/responses",
+        "/api/v1/responses",
+        "/v1/responses/responses",
+        "/responses/responses",
+        "/v1/response",
+        "/response",
+        "/api/v1/response",
+        "/v1/response/response",
+        "/response/response",
+      ];
+      for (const p of paths) {
+        const req = new Request(`http://localhost:7766${p}`, {
+          method: "POST",
+          body: "{malformed-json",
+        });
+        const res = await dispatchV4(req, "lr-zn-oo-rs-no", "req-resp-1");
+        expect(res.status).toBe(400);
+        const json = await res.json();
+        expect(json.error.message).toContain("Invalid JSON");
+      }
+    });
+
+    it("dispatches POST /v1beta/models/*:generateContent and stream to google_native handler", async () => {
+      const req1 = new Request("http://localhost:7766/v1beta/models/gemini-2.5-flash:generateContent", {
+        method: "POST",
+        body: "{malformed-json",
+      });
+      const res1 = await dispatchV4(req1, "lr-gg-gg-gc-no", "req-gg-1");
+      expect(res1.status).toBe(400);
+
+      const req2 = new Request("http://localhost:7766/v1beta/models/gemini-2.5-flash:streamGenerateContent", {
+        method: "POST",
+        body: "{malformed-json",
+      });
+      const res2 = await dispatchV4(req2, "lr-gg-gg-gc-no", "req-gg-2");
+      expect(res2.status).toBe(400);
+    });
+
+    it("dispatches POST /v1beta/openai/* to gcp_compat handler", async () => {
+      const req = new Request("http://localhost:7766/v1beta/openai/chat/completions", {
+        method: "POST",
+        body: "{malformed-json",
+      });
+      const res = await dispatchV4(req, "lr-gc-oa-ch-no", "req-gcp-1");
+      expect(res.status).toBe(400);
+      const json = await res.json();
+      expect(json.error.message).toContain("Invalid JSON");
+    });
+
+    it("dispatches POST and GET /v1beta/interactions and /v1beta/files/* to Google interactions passthrough", async () => {
+      const postInteractions = new Request("http://localhost:7766/v1beta/interactions", {
+        method: "POST",
+        body: JSON.stringify({ model: "antigravity-preview-09-2026" }),
+      });
+      const res1 = await dispatchV4(postInteractions, "lr-or-oa-ch-no", "req-int-1");
+      expect(res1.status).toBe(400);
+      const json1 = await res1.json();
+      expect(json1.error.message).toContain("Antigravity interactions requires a Google directive");
+
+      const getFileDownload = new Request(
+        "http://localhost:7766/v1beta/files/environment-abc123:download?alt=media",
+        { method: "GET" }
+      );
+      const res2 = await dispatchV4(getFileDownload, "lr-or-oa-ch-no", "req-file-1");
+      expect(res2.status).toBe(400);
+      const json2 = await res2.json();
+      expect(json2.error.message).toContain("Antigravity interactions requires a Google directive");
+
+      const postFiles = new Request("http://localhost:7766/v1beta/files/", {
+        method: "POST",
+        body: "{}",
+      });
+      const res3 = await dispatchV4(postFiles, "lr-or-oa-ch-no", "req-file-2");
+      expect(res3.status).toBe(400);
+      const json3 = await res3.json();
+      expect(json3.error.message).toContain("Antigravity interactions requires a Google directive");
+    });
+  });
+
+  describe("trace inspection endpoints", () => {
+    const originalAuth = process.env.LITEROUTER_AUTH_KEY;
+
+    beforeEach(() => {
+      process.env.LITEROUTER_AUTH_KEY = "test-admin-secret-key-123";
+      resetEnvCache();
+    });
+
+    afterEach(() => {
+      if (originalAuth !== undefined) {
+        process.env.LITEROUTER_AUTH_KEY = originalAuth;
+      } else {
+        delete process.env.LITEROUTER_AUTH_KEY;
+      }
+      resetEnvCache();
+    });
+
+    it("returns 401 when accessing traces without valid admin key", async () => {
+      const req1 = new Request("http://localhost:7766/v1/traces");
+      const res1 = await dispatchV4(req1, "", "req-t1");
+      expect(res1.status).toBe(401);
+      const json1 = await res1.json();
+      expect(json1.error.code).toBe("unauthorized");
+      expect(json1.error.message).toBe("Admin authentication required to access trace inspection endpoints");
+      expect(json1.error.type).toBe("authentication_error");
+
+      const req2 = new Request("http://localhost:7766/v1/traces/req-123");
+      const res2 = await dispatchV4(req2, "invalid-key", "req-t2");
+      expect(res2.status).toBe(401);
+      const json2 = await res2.json();
+      expect(json2.error.code).toBe("unauthorized");
+
+      // Directives must NOT be accepted as admin auth
+      const req3 = new Request("http://localhost:7766/v1/traces");
+      const res3 = await dispatchV4(req3, "lr-or-oa-ch-no", "req-t3");
+      expect(res3.status).toBe(401);
+      const json3 = await res3.json();
+      expect(json3.error.message).toBe("Admin authentication required to access trace inspection endpoints");
+    });
+
+    it("returns 401 when LITEROUTER_AUTH_KEY is not configured", async () => {
+      delete process.env.LITEROUTER_AUTH_KEY;
+      resetEnvCache();
+      const req = new Request("http://localhost:7766/v1/traces");
+      const res = await dispatchV4(req, "test-admin-secret-key-123", "req-t-no-key");
+      expect(res.status).toBe(401);
+      const json = await res.json();
+      expect(json.error.message).toBe("Admin authentication required to access trace inspection endpoints");
+    });
+
+    it("returns trace from RAM when present with master key", async () => {
+      const trace = createMockTrace("req-ram-test-1", 200);
+      traceBuffer.push(trace);
+
+      const req = new Request("http://localhost:7766/v1/traces/req-ram-test-1");
+      const res = await dispatchV4(req, "test-admin-secret-key-123", "req-caller");
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.reqId).toBe("req-ram-test-1");
+      expect(json.durationMs).toBe(120);
+    });
+
+    it("returns trace from SQLite when evicted from RAM with master key", async () => {
+      traceWriter.init(":memory:");
+      const trace = createMockTrace("req-sqlite-1", 200);
+      traceWriter.enqueue(trace);
+      traceWriter.flush();
+      traceBuffer.clear();
+
+      const req = new Request("http://localhost:7766/v1/traces/req-sqlite-1");
+      const res = await dispatchV4(req, "test-admin-secret-key-123", "req-caller");
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.reqId).toBe("req-sqlite-1");
+    });
+
+    it("returns 404 when trace is neither in RAM nor SQLite with master key", async () => {
+      const req = new Request("http://localhost:7766/v1/traces/req-missing");
+      const res = await dispatchV4(req, "test-admin-secret-key-123", "req-caller");
+      expect(res.status).toBe(404);
+      const json = await res.json();
+      expect(json.error.code).toBe("not_found");
+      expect(json.error.message).toContain("req-missing");
+    });
+
+    it("returns recent traces list for GET /v1/traces with master key", async () => {
+      traceBuffer.push(createMockTrace("trace-1", 200));
+      traceBuffer.push(createMockTrace("trace-2", 500));
+
+      const req = new Request("http://localhost:7766/v1/traces");
+      const res = await dispatchV4(req, "test-admin-secret-key-123", "req-caller");
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(Array.isArray(json.traces)).toBe(true);
+      expect(json.traces.length).toBe(2);
+    });
+
+    it("filters errors when requested via GET /v1/traces?errors=true&n=5 with master key", async () => {
+      traceBuffer.push(createMockTrace("trace-ok-1", 200));
+      traceBuffer.push(createMockTrace("trace-err-1", 500));
+      traceBuffer.push(createMockTrace("trace-ok-2", 200));
+      traceBuffer.push(createMockTrace("trace-err-2", 429));
+
+      const req = new Request("http://localhost:7766/v1/traces?errors=true&n=5");
+      const res = await dispatchV4(req, "test-admin-secret-key-123", "req-caller");
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.traces.length).toBe(2);
+      expect(json.traces.every((t: SanitizedTrace) => t.status >= 400)).toBe(true);
+    });
+  });
+
+
+  describe("trace detail cache metrics (A3)", () => {
+    const tempDirs: string[] = [];
+
+    function makeTempDir(): string {
+      const dir = mkdtempSync(join(tmpdir(), "v4-router-cache-"));
+      tempDirs.push(dir);
+      return dir;
+    }
+
+    afterEach(() => {
+      // Close the shared writer before the temp directory holding its db is removed.
+      traceWriter.drainSync();
+      while (tempDirs.length > 0) {
+        const dir = tempDirs.pop();
+        if (dir) {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it("exposes cache metrics for a migrated database via GET /v1/traces/:id", async () => {
+      process.env.LITEROUTER_AUTH_KEY = "test-admin-secret-key-123";
+      resetEnvCache();
+
+      const dbPath = join(makeTempDir(), "migrated.db");
+      traceWriter.init(dbPath);
+      traceWriter.enqueue({
+        ...createMockTrace("req-cache-migrated", 200),
+        tokensCached: 4096,
+        tokensCacheWrite: 128,
+        cacheDiscount: 0.75,
+      });
+      traceWriter.flush();
+      traceBuffer.clear();
+
+      const req = new Request("http://localhost:7766/v1/traces/req-cache-migrated");
+      const res = await dispatchV4(req, "test-admin-secret-key-123", "req-caller");
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.reqId).toBe("req-cache-migrated");
+      expect(json.tokensCached).toBe(4096);
+      expect(json.tokensCacheWrite).toBe(128);
+      expect(json.cacheDiscount).toBe(0.75);
+    });
+
+    it("exposes cache metrics from a migrated on-disk database", () => {
+      const dbPath = join(makeTempDir(), "migrated-file.db");
+      const writer = new TraceWriter();
+      writer.init(dbPath);
+      writer.enqueue({
+        ...createMockTrace("req-cache-file", 200),
+        tokensCached: 77,
+        tokensCacheWrite: 88,
+        cacheDiscount: 0.5,
+      });
+      writer.flush();
+      writer.drainSync();
+
+      const found = findTraceInDb("req-cache-file", dbPath);
+      expect(found).not.toBeNull();
+      expect(found!.tokensCached).toBe(77);
+      expect(found!.tokensCacheWrite).toBe(88);
+      expect(found!.cacheDiscount).toBe(0.5);
+    });
+
+    it("still returns the trace from a pre-migration database with cache fields undefined", () => {
+      const dbPath = join(makeTempDir(), "legacy.db");
+
+      // A database written by an older gateway: no cache columns at all.
+      const legacy = new Database(dbPath, { create: true });
+      legacy.exec(`
+        CREATE TABLE request_traces (
+          req_id TEXT PRIMARY KEY,
+          created_at INTEGER NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          status INTEGER NOT NULL,
+          duration_ms INTEGER NOT NULL,
+          ttft_ms INTEGER,
+          tokens_prompt INTEGER,
+          tokens_completion INTEGER,
+          client_inbound TEXT,
+          upstream_outbound TEXT,
+          upstream_inbound TEXT,
+          client_outbound TEXT
+        );
+      `);
+      legacy.run(
+        `INSERT INTO request_traces (req_id, created_at, provider, model, status, duration_ms,
+           tokens_prompt, tokens_completion, client_inbound, upstream_outbound, upstream_inbound,
+           client_outbound) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          "req-legacy-cache",
+          Date.now(),
+          "openrouter",
+          "test-model",
+          200,
+          120,
+          10,
+          20,
+          '{"prompt":"hello"}',
+          '{"model":"test-model"}',
+          '{"choices":[]}',
+          '{"result":"ok"}',
+        ]
+      );
+      legacy.close();
+
+      // Regression guard: selecting the cache columns unconditionally makes
+      // SQLite throw on this database, and the catch would turn an existing
+      // trace into a 404.
+      const found = findTraceInDb("req-legacy-cache", dbPath);
+      expect(found).not.toBeNull();
+      expect(found!.reqId).toBe("req-legacy-cache");
+      expect(found!.provider).toBe("openrouter");
+      expect(found!.tokensPrompt).toBe(10);
+      expect(found!.tokensCached).toBeUndefined();
+      expect(found!.tokensCacheWrite).toBeUndefined();
+      expect(found!.cacheDiscount).toBeUndefined();
+    });
+  });
+
+  describe("unknown route handling", () => {
+    it("returns 404 for unknown path", async () => {
+      const req = new Request("http://localhost:7766/v1/unknown", { method: "POST" });
+      const res = await dispatchV4(req, "lr-or-oa-ch-no", "req-unk");
+      expect(res.status).toBe(404);
+      const json = await res.json();
+      expect(json.error.code).toBe("not_found");
+      expect(json.error.message).toBe("Route not found: POST /v1/unknown");
+    });
+
+    it("returns 404 when HTTP method is not allowed on handler path", async () => {
+      const req = new Request("http://localhost:7766/v1/chat/completions", { method: "GET" });
+      const res = await dispatchV4(req, "lr-or-oa-ch-no", "req-method");
+      expect(res.status).toBe(404);
+      const json = await res.json();
+      expect(json.error.code).toBe("not_found");
+      expect(json.error.message).toBe("Route not found: GET /v1/chat/completions");
+    });
+  });
+});

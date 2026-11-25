@@ -1,0 +1,13 @@
+{
+  "profile": "local-dev",
+  "host": "127.0.0.1",
+  "port": 7766,
+  "tls_enabled": false,
+  "parent_dir": "workspace",
+  "working_folder": "literouter-gateway",
+  "base_url": "http://127.0.0.1:7766",
+  "testing": {
+    "test_port": 7767,
+    "test_base_url": "http://127.0.0.1:7767"
+  }
+}

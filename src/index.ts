@@ -1,0 +1,958 @@
+import { existsSync, readFileSync } from "node:fs";
+import http2 from "node:http2";
+import { resolve } from "node:path";
+import type { Server } from "bun";
+import { getEnv, resolveEngine } from "./config/env";
+import { loadKeyPools } from "./config/keys";
+import {
+  getAllProviders,
+  initProviderRegistry,
+} from "./config/providers";
+import { loadLocationConfig } from "./config/location";
+import { initStrategyRegistry } from "./engine/strategy_registry";
+import { parseDirective, type ParsedDirective } from "./directive/parser";
+import { extractDirectiveToken, verifyMasterSecret, resolveInferenceAuth, createUnauthorizedResponse } from "./directive/validator";
+import { handleAnthropicCompat, handleAnthropicCountTokens } from "./handlers/anthropic_compat";
+import { handleModelsDiscovery } from "./handlers/discovery";
+import { handleGcpCompat } from "./handlers/gcp_compat";
+import { dispatchV4, EMBEDDINGS_PATHS } from "./handlers/v4/router";
+import { DEFAULT_EMBEDDING_DIRECTIVE, handleV4OpenAIEmbeddings } from "./handlers/v4/openai_embeddings";
+import {
+  handleGoogleInteractionsPassthrough,
+  handleGoogleNative,
+  handleGoogleOpenAIBeta,
+  loadAndCacheNativeChains,
+  resetNativeFlashTierIndex,
+} from "./handlers/google_native";
+import {
+  globalCooldownManager,
+  globalKeyPool,
+  handleOpenAICompat,
+  initializeKeyPools,
+  resetProvidersRegistryCache,
+  resetCachedFusionEngine,
+  getCachedFusionEngine,
+  getFusionEngine,
+} from "./handlers/openai_compat";
+import {
+  type Directive,
+  type GatewayState,
+  handleOpenAiOriginal,
+} from "./handlers/openai_original";
+import { getHttp2Pool, resetHttp2Pool } from "./network/h2_pool";
+import { getAllCircuitBreakers, clearCircuitBreakerRegistry } from "./network/circuit_breaker";
+import { resetCircuitBreakers } from "./engine/circuit_breaker";
+import { traceBuffer } from "./telemetry/ring_buffer";
+import { traceWriter } from "./telemetry/trace_writer";
+import {
+  clearPacerRegistry,
+} from "./network/pacer";
+import { trackInFlight, drainInFlight } from "./lifecycle/shutdown";
+import { type BannerOptions, printBanner } from "./ui/banner";
+import { logAmber, logError, logInfo } from "./ui/logger";
+
+// Boot initialization: Load provider registry and emit deprecation warnings
+try {
+  initProviderRegistry();
+  initStrategyRegistry();
+  traceWriter.init();
+} catch (err) {
+  console.error(`[BOOT] FATAL: Provider registry failed to load`, err);
+  process.exit(1);
+}
+
+initializeKeyPools(process.env);
+
+function loadTlsOptions(tlsEnabledFlag?: boolean): { cert: string; key: string } | undefined {
+  if (process.env.LITEROUTER_TLS_ENABLED === "false" || tlsEnabledFlag === false) {
+    return undefined;
+  }
+  const certPath = resolve(process.cwd(), "certs", "localhost.pem");
+  const keyPath = resolve(process.cwd(), "certs", "localhost-key.pem");
+
+  if (existsSync(certPath) && existsSync(keyPath)) {
+    try {
+      const cert = readFileSync(certPath, "utf-8");
+      const key = readFileSync(keyPath, "utf-8");
+      return { cert, key };
+    } catch (err) {
+      logError("BOOT", "Failed to read TLS certificates", err);
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+export function handleHardReset(req?: Request, rawKey?: string): Response {
+  const token = rawKey || (req ? extractDirectiveToken(req) : "") || "";
+  const authKey = getEnv().LITEROUTER_AUTH_KEY;
+  if (!authKey) {
+    return Response.json(
+      { error: { message: "Admin endpoints disabled: LITEROUTER_AUTH_KEY not configured", type: "authentication_error" } },
+      { status: 401 }
+    );
+  }
+  const isValid = verifyMasterSecret(token, authKey);
+
+  if (!isValid) {
+    return Response.json(
+      { error: { message: "Unauthorized admin access", type: "authentication_error" } },
+      { status: 401 }
+    );
+  }
+
+  try {
+    initProviderRegistry();
+    initStrategyRegistry();
+    traceWriter.init();
+    globalCooldownManager.clearAll();
+    globalKeyPool.reset();
+    initializeKeyPools();
+    clearCircuitBreakerRegistry();
+    resetCircuitBreakers();
+    clearPacerRegistry();
+    traceBuffer.clear();
+    resetHttp2Pool();
+    resetProvidersRegistryCache();
+    loadAndCacheNativeChains();
+    resetNativeFlashTierIndex();
+    if (typeof Bun !== "undefined" && typeof Bun.gc === "function") {
+      Bun.gc(true); // Proactive compaction of JIT and heap after resetting registries
+    }
+    return Response.json(
+      {
+        status: "ok",
+        message: "Hard reset successful. Cooldowns, circuit breakers, pacers, and H2 pools reloaded.",
+        timestamp: new Date().toISOString(),
+      },
+      { status: 200 }
+    );
+  } catch (err) {
+    console.error(`[RESET] Registry reload failed, keeping previous config`, err);
+    return Response.json(
+      {
+        status: "error",
+        message: err instanceof Error ? err.message : String(err),
+      },
+      { status: 500 }
+    );
+  }
+}
+
+async function handleAdminPoolReset(req: Request, rawKey: string): Promise<Response> {
+  const token = rawKey || extractDirectiveToken(req) || "";
+  const authKey = getEnv().LITEROUTER_AUTH_KEY;
+  if (!authKey) {
+    return Response.json(
+      { error: { message: "Admin endpoints disabled: LITEROUTER_AUTH_KEY not configured", type: "authentication_error" } },
+      { status: 401 }
+    );
+  }
+  const isValid = verifyMasterSecret(token, authKey);
+
+  if (!isValid) {
+    return Response.json(
+      { error: { message: "Unauthorized admin access", type: "authentication_error" } },
+      { status: 401 }
+    );
+  }
+
+  const url = new URL(req.url);
+  let provider = url.searchParams.get("provider")?.toLowerCase().trim();
+
+  if (!provider && (req.method === "POST" || req.method === "PUT")) {
+    const contentType = req.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      try {
+        const body = (await req.json()) as { provider?: unknown };
+        if (typeof body?.provider === "string") {
+          provider = body.provider.toLowerCase().trim();
+        }
+      } catch (err: unknown) {
+        logAmber("ADMIN", `Failed to parse body JSON for pool reset: ${String(err)}`);
+      }
+    }
+  }
+
+  if (provider) {
+    globalKeyPool.reset(provider);
+    return Response.json(
+      {
+        status: "ok",
+        message: `Reset pool for provider '${provider}'. Cooldowns and timers cleared.`,
+        provider,
+        timestamp: new Date().toISOString(),
+      },
+      { status: 200 }
+    );
+  }
+
+  return handleHardReset(req, rawKey);
+}
+
+function handleHealthCheck(): Response {
+  const circuitStats: Record<string, unknown> = {};
+  for (const [provider, breaker] of getAllCircuitBreakers().entries()) {
+    circuitStats[provider] = breaker.getStats();
+  }
+
+  const h2Stats = getHttp2Pool().getSessionStats();
+
+  return Response.json(
+    {
+      status: "healthy",
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+      h2_outbound: h2Stats,
+      circuit_breakers: circuitStats,
+    },
+    { status: 200 }
+  );
+}
+
+type RouteHandler = (req: Request, rawKey: string, reqId: string) => Promise<Response>;
+
+export const CHAT_PATHS: ReadonlySet<string> = new Set([
+  "/v1/chat/completions",
+  "/chat/completions",
+  "/api/v1/chat/completions",
+  "/v1/chat/completions/chat/completions",
+  "/chat/completions/chat/completions",
+]);
+
+export const RESPONSES_PATHS: ReadonlySet<string> = new Set([
+  "/v1/responses",
+  "/responses",
+  "/api/v1/responses",
+  "/v1/responses/responses",
+  "/responses/responses",
+  "/v1/response",
+  "/response",
+  "/api/v1/response",
+  "/v1/response/response",
+  "/response/response",
+  "/v1/responses/response",
+  "/v1/response/responses",
+  "/responses/response",
+  "/response/responses",
+]);
+
+export const ANTHROPIC_PATHS: ReadonlySet<string> = new Set([
+  "/v1/messages",
+  "/messages",
+  "/api/v1/messages",
+  "/v1/messages/messages",
+  "/messages/messages",
+  "/v1/message",
+  "/message",
+  "/api/v1/message",
+  "/v1/message/message",
+  "/message/message",
+  "/v1/messages/message",
+  "/v1/message/messages",
+  "/messages/message",
+  "/message/messages",
+]);
+
+export const ANTHROPIC_COUNT_TOKENS_PATHS: ReadonlySet<string> = new Set([
+  "/v1/messages/count_tokens",
+  "/messages/count_tokens",
+  "/api/v1/messages/count_tokens",
+  "/v1/messages/messages/count_tokens",
+  "/messages/messages/count_tokens",
+  "/v1/message/count_tokens",
+  "/message/count_tokens",
+  "/api/v1/message/count_tokens",
+  "/v1/message/message/count_tokens",
+  "/message/message/count_tokens",
+]);
+
+export const MODELS_PATHS: ReadonlySet<string> = new Set([
+  "/v1/models",
+  "/v1beta/models",
+  "/models",
+  "/api/v1/models",
+]);
+
+const ROUTE_MAP: Readonly<Record<string, RouteHandler>> = {
+  "/v1/chat/completions": handleOpenAICompat,
+  "/chat/completions": handleOpenAICompat,
+  "/api/v1/chat/completions": handleOpenAICompat,
+  "/v1/chat/completions/chat/completions": handleOpenAICompat,
+  "/chat/completions/chat/completions": handleOpenAICompat,
+  "/v1/messages": handleAnthropicCompat,
+  "/messages": handleAnthropicCompat,
+  "/api/v1/messages": handleAnthropicCompat,
+  "/v1/messages/messages": handleAnthropicCompat,
+  "/messages/messages": handleAnthropicCompat,
+  "/v1/message": handleAnthropicCompat,
+  "/message": handleAnthropicCompat,
+  "/api/v1/message": handleAnthropicCompat,
+  "/v1/message/message": handleAnthropicCompat,
+  "/message/message": handleAnthropicCompat,
+  "/v1/messages/message": handleAnthropicCompat,
+  "/v1/message/messages": handleAnthropicCompat,
+  "/messages/message": handleAnthropicCompat,
+  "/message/messages": handleAnthropicCompat,
+  "/v1/messages/count_tokens": handleAnthropicCountTokens,
+  "/messages/count_tokens": handleAnthropicCountTokens,
+  "/api/v1/messages/count_tokens": handleAnthropicCountTokens,
+  "/v1/messages/messages/count_tokens": handleAnthropicCountTokens,
+  "/messages/messages/count_tokens": handleAnthropicCountTokens,
+  "/v1/message/count_tokens": handleAnthropicCountTokens,
+  "/message/count_tokens": handleAnthropicCountTokens,
+  "/api/v1/message/count_tokens": handleAnthropicCountTokens,
+  "/v1/message/message/count_tokens": handleAnthropicCountTokens,
+  "/message/message/count_tokens": handleAnthropicCountTokens,
+  "/v1/embeddings": handleV4OpenAIEmbeddings,
+  "/embeddings": handleV4OpenAIEmbeddings,
+  "/api/v1/embeddings": handleV4OpenAIEmbeddings,
+};
+
+const SYSTEM_MAP: Readonly<Record<string, () => Response>> = {
+  "/health": handleHealthCheck,
+  "/api/hello": handleHealthCheck,
+  "/hello": handleHealthCheck,
+};
+
+function dispatchModelsRoute(path: string, req: Request, rawKey: string): Promise<Response> | null {
+  if (MODELS_PATHS.has(path)) {
+    if (!rawKey) {
+      return Promise.resolve(
+        Response.json(
+          {
+            error: {
+              message: "Missing API key directive. Directives format: lr-<prov>-<payload>-<compl>-<nuances>",
+              type: "invalid_request_error",
+              code: "invalid_api_key",
+            },
+          },
+          { status: 401 }
+        )
+      );
+    }
+    const directive = parseDirective(rawKey);
+    if (!directive) {
+      return Promise.resolve(
+        Response.json(
+          {
+            error: {
+              message: `Invalid API key directive '${rawKey}'. Must follow lr-<provider>-<payload>-<completions>-<nuance>`,
+              type: "invalid_request_error",
+              code: "invalid_api_key",
+            },
+          },
+          { status: 401 }
+        )
+      );
+    }
+    return handleModelsDiscovery(req, directive);
+  }
+  return null;
+}
+
+function dispatchGoogleBeta(path: string, req: Request, rawKey: string, reqId: string): Promise<Response> | null {
+  if (path.startsWith("/v1beta/interactions") || path.startsWith("/v1beta/files/")) {
+    return handleGoogleInteractionsPassthrough(req, rawKey, reqId);
+  }
+  if (path.startsWith("/v1beta/openai/")) {
+    return handleGoogleOpenAIBeta(req, rawKey, reqId);
+  }
+  if (path.startsWith("/v1beta/models/") || path.startsWith("/v1/models/")) {
+    return handleGoogleNative(req, rawKey, reqId);
+  }
+  return null;
+}
+
+function parseDirectiveWithEndpoint(
+  rawKey: string
+): (ParsedDirective & { readonly endpoint?: string }) | null {
+  const parsed = parseDirective(rawKey);
+  if (!parsed) {
+    return null;
+  }
+  if (parsed.type === "direct") {
+    return {
+      ...parsed,
+      endpoint: parsed.completion,
+    };
+  }
+  return parsed;
+}
+
+export function validateEndpointMatch(
+  pathname: string,
+  directive?: { readonly endpoint?: string } | null
+): Response | null {
+  if (directive && "type" in directive && (directive as any).type === "fusion") {
+    return null;
+  }
+  if (EMBEDDINGS_PATHS.has(pathname) && directive?.endpoint !== "em") {
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: "Endpoint mismatch: Directive specifies non-embeddings API. Use /v1/embeddings with -em-.",
+          type: "invalid_request_error",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  if (!EMBEDDINGS_PATHS.has(pathname) && directive?.endpoint === "em") {
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: "Endpoint mismatch: Directive specifies Embeddings API (-em-). Use /v1/embeddings.",
+          type: "invalid_request_error",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  if (CHAT_PATHS.has(pathname) && directive?.endpoint === "rs") {
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: "Endpoint mismatch: Directive specifies Responses API (-rs-). Use /v1/responses.",
+          type: "invalid_request_error",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  if (RESPONSES_PATHS.has(pathname) && directive?.endpoint === "ch") {
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: "Endpoint mismatch: Directive specifies Chat Completions (-ch-). Use /v1/chat/completions.",
+          type: "invalid_request_error",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  return null;
+}
+
+function isGcpRequest(rawKey: string, parsed: ParsedDirective | null): boolean {
+  if (rawKey.startsWith("lr-gc-")) {
+    return true;
+  }
+  return parsed?.type === "direct" && parsed.provider === "gc";
+}
+
+function dispatchGcpRoute(
+  path: string,
+  req: Request,
+  rawKey: string,
+  reqId: string,
+  parsed: ParsedDirective | null
+): Promise<Response> | null {
+  if (!isGcpRequest(rawKey, parsed)) {
+    return null;
+  }
+  if (CHAT_PATHS.has(path) || path.startsWith("/v1beta/openai/")) {
+    return handleGcpCompat(req, rawKey, reqId);
+  }
+  return null;
+}
+
+function dispatchResponsesRoute(
+  req: Request,
+  path: string,
+  directive: Directive,
+  state?: GatewayState
+): Promise<Response> | null {
+  if (req.method === "POST" && RESPONSES_PATHS.has(path)) {
+    return handleOpenAiOriginal(req, directive, state);
+  }
+  return null;
+}
+
+export { dispatchV4, getCachedFusionEngine, getFusionEngine, resetCachedFusionEngine };
+
+export async function dispatchRoute(
+  req: Request,
+  rawKey: string,
+  reqId: string,
+  state?: GatewayState
+): Promise<Response> {
+  const rawPath = new URL(req.url).pathname;
+  const path = rawPath.length > 1 && rawPath.endsWith("/") ? rawPath.slice(0, -1) : rawPath;
+
+  if (path === "/admin/pool/reset") {
+    return handleAdminPoolReset(req, rawKey);
+  }
+
+  if (path === "/reset") {
+    return handleHardReset(req, rawKey);
+  }
+
+  const sysHandler = SYSTEM_MAP[path];
+  if (sysHandler) {
+    return sysHandler();
+  }
+
+  const modelsRes = dispatchModelsRoute(path, req, rawKey);
+  if (modelsRes !== null) {
+    return modelsRes;
+  }
+
+  const isTrace = path === "/v1/traces" || path.startsWith("/v1/traces/");
+  if (EMBEDDINGS_PATHS.has(path) && !rawKey) {
+    rawKey = DEFAULT_EMBEDDING_DIRECTIVE;
+  } else if (EMBEDDINGS_PATHS.has(path)) {
+    const authCheck = resolveInferenceAuth(req, rawKey);
+    rawKey = authCheck.valid && authCheck.directiveStr
+      ? authCheck.directiveStr
+      : DEFAULT_EMBEDDING_DIRECTIVE;
+  } else if (!isTrace) {
+    const authCheck = resolveInferenceAuth(req, rawKey);
+    if (!authCheck.valid) {
+      return createUnauthorizedResponse(authCheck.error);
+    }
+    rawKey = authCheck.directiveStr;
+  }
+
+  const engine = resolveEngine(req);
+  if (engine === "v4.1") {
+    return dispatchV4(req, rawKey, reqId);
+  }
+
+  const directive = parseDirectiveWithEndpoint(rawKey);
+  const mismatchRes = validateEndpointMatch(path, directive);
+  if (mismatchRes !== null) {
+    return mismatchRes;
+  }
+
+  const directiveObj = directive ?? { provider: "", raw: rawKey };
+  const responsesRes = dispatchResponsesRoute(req, path, directiveObj, state);
+  if (responsesRes !== null) {
+    return responsesRes;
+  }
+
+  const gcpRes = dispatchGcpRoute(path, req, rawKey, reqId, directive);
+  if (gcpRes !== null) {
+    return gcpRes;
+  }
+
+  const directHandler = ROUTE_MAP[path];
+  if (directHandler) {
+    return directHandler(req, rawKey, reqId);
+  }
+
+  const betaRes = dispatchGoogleBeta(path, req, rawKey, reqId);
+  if (betaRes !== null) {
+    return betaRes;
+  }
+
+  logAmber(reqId, `404 Route Not Found: ${req.method} ${path} from ${req.headers.get("user-agent") || "unknown"}`);
+  return Response.json({ error: { message: `Not Found: ${path}`, type: "invalid_request_error" } }, { status: 404 });
+}
+
+export function resetAllState(): void {
+  initProviderRegistry();
+  initStrategyRegistry();
+  traceWriter.init();
+  globalCooldownManager.clearAll();
+  globalKeyPool.reset();
+  initializeKeyPools();
+  clearCircuitBreakerRegistry();
+  resetCircuitBreakers();
+  clearPacerRegistry();
+  traceBuffer.clear();
+  resetHttp2Pool();
+  resetProvidersRegistryCache();
+  loadAndCacheNativeChains();
+  resetNativeFlashTierIndex();
+}
+
+export function getCooldownState(): Record<string, unknown> {
+  return {};
+}
+
+export async function handleAppRequest(req: Request): Promise<Response> {
+  const reqId =
+    req.headers.get("x-request-id") ||
+    req.headers.get("x-req-id") ||
+    `req_${Math.random().toString(36).slice(2, 9)}`;
+  const rawPath = new URL(req.url).pathname;
+  const path = rawPath.length > 1 && rawPath.endsWith("/") ? rawPath.slice(0, -1) : rawPath;
+  let rawKey = extractDirectiveToken(req) || "";
+  if (EMBEDDINGS_PATHS.has(path) && !rawKey) {
+    rawKey = "lr-fse-embeddings";
+  }
+  try {
+    const res = await dispatchRoute(req, rawKey, reqId);
+    try {
+      res.headers.set("x-request-id", reqId);
+    } catch (headerErr) {
+      logAmber(reqId, `Could not set x-request-id header: ${headerErr}`);
+    }
+    return res;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err ?? "");
+    const isStreamAbort =
+      (req.signal && req.signal.aborted) ||
+      msg.includes("The pending stream has been canceled") ||
+      msg.includes("ERR_HTTP2_STREAM_CANCEL") ||
+      msg.includes("aborted");
+
+    if (isStreamAbort) {
+      logInfo(reqId, "Client aborted / stream canceled");
+      return Response.json(
+        { error: { message: "Request aborted by client", type: "client_closed_request" } },
+        { status: 499 }
+      );
+    }
+    logError(reqId, "Unhandled exception in request handler", err);
+    return Response.json({ error: { message: "Internal Gateway Error", type: "server_error" } }, { status: 500 });
+  }
+}
+
+function nodeHeadersToFetchHeaders(rawHeaders: NodeJS.Dict<string | string[]>): Headers {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(rawHeaders)) {
+    if (!key || key.startsWith(":") || value === undefined) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const v of value) {
+        headers.append(key, v);
+      }
+    } else {
+      headers.set(key, value);
+    }
+  }
+  return headers;
+}
+
+async function pipeWebResponseToNode(
+  webRes: Response,
+  _nodeReq: http2.Http2ServerRequest,
+  nodeRes: http2.Http2ServerResponse
+): Promise<void> {
+  if (nodeRes.destroyed || nodeRes.writableEnded) {
+    return;
+  }
+
+  nodeRes.statusCode = webRes.status;
+  webRes.headers.forEach((val, key) => {
+    const lower = key.toLowerCase();
+    if (lower !== "transfer-encoding" && lower !== "connection") {
+      nodeRes.setHeader(key, val);
+    }
+  });
+
+  if (!webRes.body) {
+    if (!nodeRes.writableEnded && !nodeRes.destroyed) {
+      nodeRes.end();
+    }
+    return;
+  }
+
+  const reader = webRes.body.getReader();
+  let isAborted = false;
+
+  const cancelReader = () => {
+    if (isAborted) return;
+    isAborted = true;
+    reader.cancel().catch((cancelErr: unknown) => {
+      const cancelMsg = cancelErr instanceof Error ? cancelErr.message : String(cancelErr ?? "");
+      console.debug(`[H2 Server] Reader cancel error: ${cancelMsg}`);
+    });
+  };
+
+  const onResClose = () => {
+    if (!nodeRes.writableEnded) {
+      cancelReader();
+    }
+  };
+
+  nodeRes.once("close", onResClose);
+
+  try {
+    while (!isAborted && !nodeRes.destroyed && !nodeRes.writableEnded) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value && !nodeRes.destroyed && !nodeRes.writableEnded) {
+        const canContinue = nodeRes.write(value);
+        if (!canContinue && !nodeRes.destroyed && !nodeRes.writableEnded) {
+          await new Promise<void>((resolve) => nodeRes.once("drain", resolve));
+        }
+      }
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err ?? "");
+    const isStreamAbort =
+      isAborted ||
+      nodeRes.destroyed ||
+      msg.includes("The pending stream has been canceled") ||
+      msg.includes("ERR_HTTP2_STREAM_CANCEL") ||
+      msg.includes("aborted");
+
+    if (!isStreamAbort) {
+      logError("STREAM", "Stream read error during HTTP/2 response piping", err);
+    }
+    if (!nodeRes.destroyed && !nodeRes.writableEnded) {
+      try {
+        nodeRes.destroy(err instanceof Error ? err : new Error(String(err)));
+      } catch (destroyErr: unknown) {
+        console.debug("[H2 Server] Error destroying nodeRes stream:", destroyErr);
+      }
+    }
+  } finally {
+    nodeRes.removeListener("close", onResClose);
+    if (!nodeRes.writableEnded && !nodeRes.destroyed) {
+      try {
+        nodeRes.end();
+      } catch (endErr: unknown) {
+        console.debug("[H2 Server] Error ending nodeRes stream:", endErr);
+      }
+    }
+  }
+}
+
+export interface LiteRouterServer {
+  readonly port: number;
+  readonly stop: () => void | Promise<void>;
+}
+
+export const MAX_REQUEST_BODY_SIZE = 32 * 1024 * 1024; // 32MB
+
+export function createServer(portOverride?: number): Server<unknown> | LiteRouterServer {
+  initProviderRegistry();
+  initStrategyRegistry();
+  traceWriter.init();
+  initializeKeyPools();
+  loadAndCacheNativeChains();
+  const env = getEnv();
+
+  // Single authority: config/location.json
+  const locationConfig = loadLocationConfig();
+
+  let envPort: number | undefined;
+  if (process.env.LITEROUTER_PORT) {
+    const parsed = Number(process.env.LITEROUTER_PORT);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+      envPort = parsed;
+    } else {
+      console.warn(`[Config] Invalid LITEROUTER_PORT: "${process.env.LITEROUTER_PORT}". Falling back to locationConfig.port.`);
+    }
+  }
+
+  const port = portOverride ?? envPort ?? locationConfig.port;
+  const host = process.env.LITEROUTER_HOST || locationConfig.host;
+  const tlsEnabled = locationConfig.tls_enabled;
+  const tls = tlsEnabled ? loadTlsOptions(true) : undefined;
+
+  const pools = loadKeyPools(process.env);
+  const keyPools = Array.from(pools.entries())
+    .map(([code, keys]) => ({ provider: code, activeKeys: keys.length }))
+    .filter((p) => p.activeKeys > 0);
+
+  const bannerOpts: BannerOptions = {
+    port,
+    tlsEnabled: Boolean(tls),
+    stripReasoning: env.LITEROUTER_STRIP_REASONING,
+    keyPools,
+  };
+  printBanner(bannerOpts);
+
+  if (tls && env.LITEROUTER_HTTP2) {
+    const h2Server = http2.createSecureServer(
+      {
+        cert: tls.cert,
+        key: tls.key,
+        allowHTTP1: true,
+        ALPNProtocols: ["h2", "http/1.1"],
+      },
+      async (nodeReq, nodeRes) => {
+        nodeReq.on("error", () => {});
+        nodeRes.on("error", () => {});
+
+        const abortController = new AbortController();
+        const onAbort = () => {
+          if (!nodeRes.writableEnded) {
+            try {
+              if (!abortController.signal.aborted) {
+                abortController.abort();
+              }
+            } catch (abortErr: unknown) {
+              console.debug("[H2 Server] Client abort exception:", abortErr);
+            }
+          }
+        };
+        nodeReq.once("aborted", onAbort);
+        nodeRes.once("close", onAbort);
+
+        let receivedBytes = 0;
+        let isOverLimit = false;
+        const chunks: Buffer[] = [];
+        nodeReq.on("data", (chunk) => {
+          if (isOverLimit) return;
+          const buf = Buffer.from(chunk);
+          receivedBytes += buf.length;
+          if (receivedBytes > MAX_REQUEST_BODY_SIZE) {
+            isOverLimit = true;
+            chunks.length = 0; // Release allocated chunks
+            nodeReq.destroy();
+            if (!nodeRes.headersSent && !nodeRes.destroyed) {
+              nodeRes.writeHead(413, { "content-type": "application/json" });
+              nodeRes.end(
+                JSON.stringify({
+                  error: {
+                    message: "Payload Too Large: request body exceeds 32MB limit",
+                    type: "invalid_request_error",
+                    code: "payload_too_large",
+                  },
+                })
+              );
+            }
+            return;
+          }
+          chunks.push(buf);
+        });
+        nodeReq.on("end", async () => {
+          if (isOverLimit) return;
+          const reqId = `req_${Math.random().toString(36).slice(2, 9)}`;
+          try {
+            const hasBody = !["GET", "HEAD"].includes(nodeReq.method || "");
+            const body = hasBody && chunks.length > 0 ? Buffer.concat(chunks) : undefined;
+            const authority = (nodeReq.headers[":authority"] as string) || nodeReq.headers.host || `localhost:${port}`;
+            const url = `https://${authority}${nodeReq.url}`;
+
+            const fetchHeaders = nodeHeadersToFetchHeaders(nodeReq.headers);
+            fetchHeaders.set("x-http-version", `HTTP/${nodeReq.httpVersion}`);
+
+            const req = new Request(url, {
+              method: nodeReq.method,
+              headers: fetchHeaders,
+              body,
+              signal: abortController.signal,
+            });
+
+            const webRes = await trackInFlight(handleAppRequest(req));
+            await pipeWebResponseToNode(webRes, nodeReq, nodeRes);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err ?? "");
+            const isClientAbort =
+              abortController.signal.aborted ||
+              nodeRes.destroyed ||
+              msg.includes("The pending stream has been canceled") ||
+              msg.includes("ERR_HTTP2_STREAM_CANCEL") ||
+              msg.includes("aborted") ||
+              msg.includes("premature close");
+
+            if (isClientAbort) {
+              logAmber(reqId, `Downstream HTTP/2 client stream aborted/canceled: ${msg}`);
+            } else {
+              logError(reqId, "Unhandled exception in HTTP/2 server route dispatch", err);
+              if (!nodeRes.headersSent && !nodeRes.destroyed) {
+                nodeRes.writeHead(500, { "content-type": "application/json" });
+                nodeRes.end(JSON.stringify({ error: { message: "Internal Gateway Error", type: "server_error" } }));
+              }
+            }
+          } finally {
+            nodeReq.removeListener("aborted", onAbort);
+            nodeRes.removeListener("close", onAbort);
+          }
+        });
+      }
+    );
+
+    h2Server.on("clientError", (_err, socket) => {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+    });
+
+    h2Server.on("unknownProtocol", (socket) => {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+    });
+
+    h2Server.listen(port, host);
+
+    return {
+      port,
+      stop: () =>
+        new Promise<void>((resolve) => {
+          traceWriter.drainSync();
+          h2Server.close(() => resolve());
+        }),
+    };
+  }
+
+  return Bun.serve({
+    port,
+    hostname: host,
+    idleTimeout: env.LITEROUTER_IDLE_TIMEOUT_SEC,
+    maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
+    tls: tls ? { cert: tls.cert, key: tls.key } : undefined,
+    async fetch(req: Request) {
+      return trackInFlight(handleAppRequest(req));
+    },
+  });
+}
+
+export function closeServer(server?: Server<unknown> | LiteRouterServer): void {
+  traceWriter.drainSync();
+  if (!server) return;
+  if ("stop" in server && typeof server.stop === "function") {
+    server.stop();
+  }
+}
+
+const isClientAbortReason = (reason: unknown): boolean => {
+  const isAbort = reason instanceof Error && reason.name === "AbortError";
+  if (isAbort) {
+    return true;
+  }
+  const msg = reason instanceof Error ? reason.message : String(reason ?? "");
+  return (
+    msg.includes("aborted") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("EPIPE") ||
+    msg.includes("ERR_HTTP2_STREAM_CANCEL")
+  );
+};
+
+process.on("uncaughtException", (err) => {
+  if (isClientAbortReason(err)) {
+    return;
+  }
+  console.error("FATAL: Uncaught exception in gateway process:", err);
+  traceWriter.drainSync();
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  if (isClientAbortReason(reason)) {
+    return;
+  }
+  console.error("Unhandled promise rejection in gateway process:", reason);
+});
+
+process.on("SIGINT", async () => {
+  await drainInFlight(10000);
+  traceWriter.drainSync();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  await drainInFlight(10000);
+  traceWriter.drainSync();
+  process.exit(0);
+});
+
+process.on("beforeExit", () => {
+  traceWriter.drainSync();
+});
+
+if (import.meta.main) {
+  createServer();
+}

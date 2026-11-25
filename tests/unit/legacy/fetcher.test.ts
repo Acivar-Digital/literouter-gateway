@@ -1,0 +1,318 @@
+import { describe, expect, it, spyOn } from "bun:test";
+import {
+  NoResponseError,
+  createResilientStream,
+  extractFinishReasonFromChunk,
+  fetchWithTtftGuard,
+  formatMidstreamErrorFrame,
+  hasContentToken,
+  isInBandErrorChunk,
+  readFirstChunkWithTimeout,
+  readFirstContentChunkWithTimeout,
+  resolveTtftTimeout,
+} from "../../../src/network/fetcher";
+
+const decoder = new TextDecoder();
+
+describe("Fetcher — Transport Error Wrapping", () => {
+  it("wraps raw fetch network transport exceptions in NoResponseError when signal is not aborted", async () => {
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((() => {
+      return Promise.reject(new TypeError("Failed to fetch: Connection refused"));
+    }) as unknown as typeof fetch);
+
+    const options = {
+      url: "http://127.0.0.1:59999/unreachable-test-endpoint",
+      method: "POST" as const,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ test: true }),
+      provider: "test-provider",
+      keyIndex: 0,
+    };
+
+    let thrownError: unknown;
+    try {
+      await fetchWithTtftGuard(options);
+    } catch (err: unknown) {
+      thrownError = err;
+    } finally {
+      fetchSpy.mockRestore();
+    }
+
+    expect(thrownError).toBeInstanceOf(NoResponseError);
+    expect((thrownError as Error).message).toBe("Network transport failure: Failed to fetch: Connection refused");
+  });
+
+  it("rethrows raw error when clientSignal is aborted", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("Client cancelled request"));
+
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((() => {
+      const abortErr = new Error("The operation was aborted");
+      abortErr.name = "AbortError";
+      return Promise.reject(abortErr);
+    }) as unknown as typeof fetch);
+
+    const options = {
+      url: "http://127.0.0.1:59999/unreachable-test-endpoint",
+      method: "POST" as const,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ test: true }),
+      clientSignal: controller.signal,
+      provider: "test-provider",
+      keyIndex: 0,
+    };
+
+    let thrownError: unknown;
+    try {
+      await fetchWithTtftGuard(options);
+    } catch (err: unknown) {
+      thrownError = err;
+    } finally {
+      fetchSpy.mockRestore();
+    }
+
+    expect(thrownError).not.toBeInstanceOf(NoResponseError);
+    expect((thrownError as Error).message).toBe("The operation was aborted");
+  });
+});
+
+describe("Dynamic TTFT Resolution (`resolveTtftTimeout`)", () => {
+  it("defaults to 120000ms (120s) when model is undefined or empty", () => {
+    expect(resolveTtftTimeout()).toBe(120000);
+    expect(resolveTtftTimeout(undefined, undefined)).toBe(120000);
+    expect(resolveTtftTimeout("", undefined)).toBe(120000);
+  });
+
+  it("uses envTimeoutMs when provided for all models", () => {
+    expect(resolveTtftTimeout("gpt-4o", 8000)).toBe(8000);
+    expect(resolveTtftTimeout("claude-3-5-sonnet-20241022", 10000)).toBe(10000);
+    expect(resolveTtftTimeout("meta-llama/llama-3.3-70b-instruct")).toBe(120000);
+    expect(resolveTtftTimeout("meta-llama/llama-3.3-70b-instruct", 50000)).toBe(50000);
+  });
+
+  it("unifies TTFT timeout to 120000ms across all models including reasoning and preview models", () => {
+    const models = [
+      "o1",
+      "o1-mini",
+      "o1-preview",
+      "o3",
+      "o3-mini",
+      "deepseek-reasoner",
+      "deepseek/deepseek-r1",
+      "deepseek-r1-distill-llama-70b",
+      "claude-3-7-sonnet-thought",
+      "claude-3-7-sonnet:thought",
+      "custom-thinking-model",
+      "gemini-2.5-flash-preview",
+      "qwen-coder-32b",
+      "dots-ocr-preview",
+      "deepseek-coder",
+      "gpt-4o",
+    ];
+
+    for (const model of models) {
+      expect(resolveTtftTimeout(model)).toBe(120000);
+      expect(resolveTtftTimeout(model, 30000)).toBe(30000);
+    }
+  });
+});
+
+describe("Wire-Compliant Midstream Error Frame (`formatMidstreamErrorFrame`)", () => {
+  it("formats Anthropic error frame correctly for 'anthropic' and 'cl'", () => {
+    const message = "Upstream stream interrupted mid-generation";
+
+    const anthropicBytes = formatMidstreamErrorFrame("anthropic", message);
+    const anthropicText = decoder.decode(anthropicBytes);
+    expect(anthropicText).toBe(
+      `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message } })}\n\n`
+    );
+
+    const clBytes = formatMidstreamErrorFrame("cl", message);
+    const clText = decoder.decode(clBytes);
+    expect(clText).toBe(
+      `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message } })}\n\n`
+    );
+  });
+
+  it("formats OpenAI error frame correctly with [DONE] marker for 'openai' and default", () => {
+    const message = "Upstream connection dropped";
+
+    const openaiBytes = formatMidstreamErrorFrame("openai", message);
+    const openaiText = decoder.decode(openaiBytes);
+    const openaiPayload = JSON.parse(openaiText.split("\n")[0]?.slice("data: ".length) ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    expect(openaiPayload.object).toBe("chat.completion.chunk");
+    expect(String(openaiPayload.id)).toMatch(/^err-/);
+    expect(openaiPayload.model).toBe("error");
+    expect(typeof openaiPayload.created).toBe("number");
+    const openaiErr = openaiPayload.error as Record<string, unknown>;
+    expect(openaiErr.message).toBe(message);
+    expect(openaiErr.code).toBe("server_error");
+    expect(openaiErr.type).toBe("server_error");
+    const openaiChoices = openaiPayload.choices as Array<Record<string, unknown>>;
+    expect(Array.isArray(openaiChoices)).toBe(true);
+    expect(openaiChoices.length).toBe(1);
+    expect(openaiChoices[0]?.finish_reason).toBe("error");
+    expect(openaiText).toContain("\n\ndata: [DONE]\n\n");
+
+    const defaultBytes = formatMidstreamErrorFrame("other-protocol", message);
+    const defaultText = decoder.decode(defaultBytes);
+    const defaultPayload = JSON.parse(
+      defaultText.split("\n")[0]?.slice("data: ".length) ?? "{}"
+    ) as Record<string, unknown>;
+    expect(defaultPayload.object).toBe("chat.completion.chunk");
+    const defaultChoices = defaultPayload.choices as Array<Record<string, unknown>>;
+    expect(Array.isArray(defaultChoices)).toBe(true);
+    expect(defaultChoices[0]?.finish_reason).toBe("error");
+    expect(defaultText).toContain("\n\ndata: [DONE]\n\n");
+  });
+
+  it("includes choices array with finish_reason error in midstream error frame", () => {
+    const text = decoder.decode(formatMidstreamErrorFrame("openai", "boom", "stream_error"));
+    const payload = JSON.parse(text.split("\n")[0]?.slice("data: ".length) ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    const choices = payload.choices as Array<Record<string, unknown>>;
+    expect(Array.isArray(choices)).toBe(true);
+    expect(choices[0]?.finish_reason).toBe("error");
+    const err = payload.error as Record<string, unknown>;
+    expect(err.code).toBe("stream_error");
+    expect(err.type).toBe("stream_error");
+  });
+
+  it("does not treat ': OPENROUTER PROCESSING' as a content token", () => {
+    expect(hasContentToken(": OPENROUTER PROCESSING")).toBe(false);
+    expect(hasContentToken(": keep-alive")).toBe(false);
+    expect(hasContentToken(": OPENROUTER PROCESSING\ndata: [DONE]")).toBe(false);
+  });
+
+  it("ignores ': OPENROUTER PROCESSING' in isInBandErrorChunk", () => {
+    expect(isInBandErrorChunk(": OPENROUTER PROCESSING").isError).toBe(false);
+    expect(isInBandErrorChunk(": OPENROUTER PROCESSING\n\n").isError).toBe(false);
+    expect(isInBandErrorChunk(": OPENROUTER PROCESSING\ndata: [DONE]\n\n").isError).toBe(false);
+  });
+});
+
+describe("Stream First Chunk TTFT Timeout (`readFirstChunkWithTimeout`)", () => {
+  it("rejects with NoResponseError when chunk is not read within timeoutMs", async () => {
+    const slowStream = new ReadableStream<Uint8Array>({
+      start() {
+        // Stalled stream - produces no tokens
+      },
+    });
+
+    const reader = slowStream.getReader();
+    let thrownError: unknown;
+    try {
+      await readFirstChunkWithTimeout(reader, 50);
+    } catch (err: unknown) {
+      thrownError = err;
+    } finally {
+      reader.releaseLock();
+    }
+
+    expect(thrownError).toBeInstanceOf(NoResponseError);
+    expect((thrownError as Error).message).toContain("TTFT exceeded 50ms");
+  });
+
+  it("resolves promptly when first chunk is received before timeoutMs", async () => {
+    const encoder = new TextEncoder();
+    const fastStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: {\"content\":\"hello\"}\n\n"));
+      },
+    });
+
+    const reader = fastStream.getReader();
+    const result = await readFirstChunkWithTimeout(reader, 1000);
+    reader.releaseLock();
+
+    expect(result.done).toBe(false);
+    expect(result.value).toBeDefined();
+    expect(decoder.decode(result.value)).toContain("hello");
+  });
+});
+
+describe("Content Chunk Reading with Multi-Packet Buffering (`readFirstContentChunkWithTimeout`)", () => {
+  it("buffers initial empty newlines/preambles until content arrives and returns combined buffer", async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("\n\n"));
+        controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"content\":\"chunk2\"}}]}\n\n"));
+        controller.close();
+      },
+    });
+
+    const reader = stream.getReader();
+    const result = await readFirstContentChunkWithTimeout(reader, 1000, 200);
+    reader.releaseLock();
+
+    const decoded = decoder.decode(result);
+    expect(decoded).toContain("\n\n");
+    expect(decoded).toContain("chunk2");
+  });
+
+  it("throws NoResponseError when stream closes with 0 content tokens after empty chunks", async () => {
+    const encoder = new TextEncoder();
+    const emptyStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("   \n\n"));
+        controller.close();
+      },
+    });
+
+    const reader = emptyStream.getReader();
+    let thrownError: unknown;
+    try {
+      await readFirstContentChunkWithTimeout(reader, 1000, 200);
+    } catch (err: unknown) {
+      thrownError = err;
+    } finally {
+      reader.releaseLock();
+    }
+
+    expect(thrownError).toBeInstanceOf(NoResponseError);
+    expect((thrownError as Error).message).toBe("HTTP 200 returned ghost response with 0 content tokens");
+  });
+
+  it("extracts finish_reason from SSE chunks", () => {
+    expect(extractFinishReasonFromChunk('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')).toBe("stop");
+    expect(extractFinishReasonFromChunk('data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n')).toBe("length");
+    expect(extractFinishReasonFromChunk('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n')).toBe("tool_calls");
+    expect(extractFinishReasonFromChunk('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n\n')).toBe(null);
+    expect(extractFinishReasonFromChunk('data: [DONE]\n\n')).toBe(null);
+  });
+
+  it("calls onFinishReason callback when resilient stream processes chunk with finish_reason", async () => {
+    const encoder = new TextEncoder();
+    let capturedReason = "";
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+
+    const reader = stream.getReader();
+    const resilient = createResilientStream(new Uint8Array(0), reader, {
+      onFinishReason: (reason) => {
+        capturedReason = reason;
+      },
+    });
+
+    const resilientReader = resilient.getReader();
+    while (true) {
+      const { done } = await resilientReader.read();
+      if (done) break;
+    }
+
+    expect(capturedReason).toBe("stop");
+  });
+});

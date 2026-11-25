@@ -1,0 +1,1234 @@
+import type { ParsedDirective } from "../directive/parser";
+import { validateDirective } from "../directive/validator";
+import { getEnv } from "../config/env";
+import { getProviderConfig, isRegisteredProvider } from "../config/providers";
+import { calculateRetryDelay } from "../engine/retry";
+import { classifyUpstreamError } from "../network/classifier";
+import {
+  fetchWithTtftGuard,
+  reassembleResponse,
+  sanitizeDownstreamHeaders,
+  type FetcherOptions,
+  type OutboundProtocol,
+} from "../network/fetcher";
+import { getPacerForProvider, PacerQueueOverflowError } from "../network/pacer";
+import { isFatalAuthError } from "../network/pool";
+import {
+  buildAuthHeaders,
+  globalKeyPool,
+  overrideProviderUrl,
+  resolveUpstreamEndpoint,
+} from "./openai_compat";
+import {
+  EMOJI,
+  extractErrorMessage,
+  formatTimestamp,
+  logError,
+  logExhausted,
+  logFinishReason,
+  logInbound,
+  logInfo,
+  logLimit,
+  logRotate,
+  logSeparator,
+  logServed,
+  logTtft,
+  logUsage,
+  logWarn,
+} from "../ui/logger";
+export {
+  OpenAIResponsesTransformer,
+  openAiResponsesTransformer,
+} from "../transformers/openai_responses";
+
+export type Directive =
+  | ParsedDirective
+  | {
+      readonly provider: string;
+      readonly raw?: string;
+      readonly type?: string;
+      readonly [key: string]: unknown;
+    };
+
+export interface KeyPoolManager {
+  getKey?(provider: string): string | null;
+  selectNextKey?(provider: string): { key: string; index: number } | null;
+  getNextKey?(provider: string): string | null;
+}
+
+export interface GatewayState {
+  readonly keyPoolManager?: KeyPoolManager;
+}
+
+interface ResolvedRoute {
+  readonly provider: string;
+  readonly upstreamUrl: string;
+  readonly key: string;
+  readonly keyIndex: number;
+}
+
+export function resolveUpstreamResponsesUrl(provider: string): string | null {
+  if (!isRegisteredProvider(provider)) {
+    return null;
+  }
+  const config = getProviderConfig(provider);
+  const endpoints = config.endpoints as Record<string, string | undefined>;
+  const rawPath = endpoints["rs"];
+  if (!rawPath) {
+    return null;
+  }
+  const targetUrl = `${config.base_url}${rawPath}`;
+  return overrideProviderUrl(targetUrl, provider);
+}
+
+export function buildUpstreamHeaders(
+  key: string,
+  provider: string,
+  incomingHeaders?: Headers | Record<string, string>
+): Record<string, string> {
+  const headers = buildAuthHeaders("Bearer", key, provider, incomingHeaders);
+  if (incomingHeaders) {
+    if (incomingHeaders instanceof Headers) {
+      if (incomingHeaders.has("accept")) {
+        headers["Accept"] = incomingHeaders.get("accept") ?? "*/*";
+      }
+    } else {
+      const accept = incomingHeaders["accept"] ?? incomingHeaders["Accept"];
+      if (accept) {
+        headers["Accept"] = accept;
+      }
+    }
+  }
+  const strategyIsZen = isRegisteredProvider(provider) && getProviderConfig(provider)?.strategy === "zen";
+  if (strategyIsZen) {
+    const { scrubZenHeaders, buildZenHeaders } = require("../engine/zen");
+    scrubZenHeaders(headers);
+    Object.assign(headers, buildZenHeaders(incomingHeaders));
+  }
+  return headers;
+}
+
+function tryStateKeyPool(
+  provider: string,
+  manager?: KeyPoolManager
+): { key: string; index: number } | null {
+  if (!manager) {
+    return null;
+  }
+  if (manager.selectNextKey) {
+    return manager.selectNextKey(provider);
+  }
+  if (manager.getKey) {
+    const key = manager.getKey(provider);
+    return key ? { key, index: 0 } : null;
+  }
+  if (manager.getNextKey) {
+    const key = manager.getNextKey(provider);
+    return key ? { key, index: 0 } : null;
+  }
+  return null;
+}
+
+export function resolveApiKey(
+  provider: string,
+  state?: GatewayState
+): { key: string; index: number } | null {
+  const fromState = tryStateKeyPool(provider, state?.keyPoolManager);
+  if (fromState) {
+    return fromState;
+  }
+  const selected = globalKeyPool.selectNextKey(provider);
+  return selected ? { key: selected.key, index: selected.index } : null;
+}
+
+export function buildSseHeaders(): Headers {
+  const headers = new Headers();
+  headers.set("Content-Type", "text/event-stream");
+  headers.set("Cache-Control", "no-cache");
+  headers.set("Connection", "keep-alive");
+  return headers;
+}
+
+export interface ResponsesTelemetry {
+  readonly reqId: string;
+  readonly provider: string;
+  readonly keyIndex: number;
+  readonly totalKeys?: number;
+  readonly startTime: number;
+  readonly status: number;
+}
+
+function extractReasoningEffort(body: { readonly [key: string]: unknown }): string | undefined {
+  const reasoning = body.reasoning;
+  if (reasoning && typeof reasoning === "object") {
+    const effort = (reasoning as Record<string, unknown>).effort;
+    return typeof effort === "string" && effort.length > 0 ? effort : undefined;
+  }
+  return undefined;
+}
+
+function extractDirectiveNuances(directiveOrRawKey: Directive | string): readonly string[] | undefined {
+  if (typeof directiveOrRawKey === "string") {
+    return undefined;
+  }
+  const nuances = (directiveOrRawKey as Record<string, unknown>).nuances;
+  const isStringArray = Array.isArray(nuances) && nuances.every((n) => typeof n === "string");
+  return isStringArray ? (nuances as readonly string[]) : undefined;
+}
+
+function logPrepLine(reqId: string, model: string | undefined, inputBytes: number, effort: string | undefined, stream: boolean): void {
+  const effortStr = effort ? ` effort=${effort}` : "";
+  const msg = `[PREP ${reqId}] model=${model ?? "unknown"} input=${inputBytes}B${effortStr} stream=${stream}`;
+  if (model) {
+    logInfo(EMOJI.prep, msg);
+  } else {
+    logWarn(EMOJI.prep, msg);
+  }
+}
+
+function logUpstreamLine(reqId: string, provider: string, upstreamUrl: string, isStream: boolean): void {
+  logInfo(EMOJI.upstream, `[UPSTREAM ${reqId}] ${provider} -> ${upstreamUrl} stream=${isStream}`);
+}
+
+function getRetryAfterSec(res: Response): number | undefined {
+  const raw = res.headers.get("retry-after");
+  if (!raw) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+async function logUpstreamError(reqId: string, route: ResolvedRoute, totalKeys: number | undefined, res: Response): Promise<void> {
+  try {
+    const bodyText = await res.clone().text();
+    const rawMsg = extractErrorMessage(bodyText);
+    const quarantineEnabled = globalKeyPool.isQuarantineEnabled(route.provider);
+    const ttl = quarantineEnabled && (res.status !== 429 || getEnv().COOLDOWN_RATE_LIMIT_TTL_SEC > 0)
+      ? (getRetryAfterSec(res) ?? (res.status === 429 ? getEnv().COOLDOWN_RATE_LIMIT_TTL_SEC : undefined))
+      : undefined;
+    logLimit(reqId, route.provider, route.keyIndex, res.status, ttl, totalKeys, rawMsg);
+  } catch (err: unknown) {
+    logWarn(EMOJI.limit, `Failed to inspect upstream error body: ${err}`);
+  }
+}
+
+export interface ParsedResponsesUsage {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly reasoningTokens?: number;
+  readonly cachedTokens?: number;
+}
+
+export function tryParseResponsesUsage(text: string): ParsedResponsesUsage | null {
+  try {
+    const json = JSON.parse(text) as Record<string, unknown>;
+    const root = (json.response && typeof json.response === "object")
+      ? (json.response as Record<string, unknown>)
+      : json;
+    const rawUsage = (root.usage && typeof root.usage === "object")
+      ? root.usage
+      : (json.usage && typeof json.usage === "object")
+        ? json.usage
+        : (typeof json.input_tokens === "number" || typeof json.prompt_tokens === "number")
+          ? json
+          : null;
+    if (!rawUsage || typeof rawUsage !== "object") {
+      return null;
+    }
+    const u = rawUsage as Record<string, unknown>;
+    const prompt = typeof u.input_tokens === "number"
+      ? u.input_tokens
+      : typeof u.prompt_tokens === "number"
+        ? u.prompt_tokens
+        : null;
+    const completion = typeof u.output_tokens === "number"
+      ? u.output_tokens
+      : typeof u.completion_tokens === "number"
+        ? u.completion_tokens
+        : null;
+    if (prompt === null || completion === null) {
+      return null;
+    }
+    const total = typeof u.total_tokens === "number" ? u.total_tokens : prompt + completion;
+
+    let reasoningTokens: number | undefined;
+    const outputDetails = (u.output_tokens_details ?? u.completion_tokens_details) as Record<string, unknown> | undefined;
+    if (outputDetails && typeof outputDetails === "object") {
+      const r = outputDetails.reasoning_tokens;
+      if (typeof r === "number") {
+        reasoningTokens = r;
+      }
+    }
+
+    let cachedTokens: number | undefined;
+    const inputDetails = (u.input_tokens_details ?? u.prompt_tokens_details) as Record<string, unknown> | undefined;
+    if (inputDetails && typeof inputDetails === "object") {
+      const c = inputDetails.cached_tokens;
+      if (typeof c === "number") {
+        cachedTokens = c;
+      }
+    }
+
+    return {
+      promptTokens: prompt,
+      completionTokens: completion,
+      totalTokens: total,
+      ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+      ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function emitNonStreamCompletion(telemetry: ResponsesTelemetry, bodyText: string, byteLength: number): void {
+  const durationMs = Date.now() - telemetry.startTime;
+  const usage = tryParseResponsesUsage(bodyText);
+  if (usage) {
+    logUsage({
+      reqId: telemetry.reqId,
+      provider: telemetry.provider,
+      keyIndex: telemetry.keyIndex,
+      totalKeys: telemetry.totalKeys,
+      promptTokens: usage.promptTokens,
+      reasoningTokens: usage.reasoningTokens,
+      completionTokens: usage.completionTokens,
+      totalTokens: usage.totalTokens,
+      durationMs,
+    });
+  } else {
+    logInfo(EMOJI.stats, `[COMPLETE ${telemetry.reqId}] bytes=${byteLength} duration=${durationMs}ms (usage unavailable)`);
+  }
+  const finishReason = tryParseResponsesFinishReason(bodyText) || "stop";
+  logFinishReason(telemetry.reqId, finishReason);
+  logServed(telemetry.reqId, durationMs, telemetry.status);
+  logSeparator();
+}
+
+export function tryParseResponsesFinishReason(text: string): string | null {
+  try {
+    const data = JSON.parse(text) as Record<string, unknown>;
+    const response = (data.response && typeof data.response === "object")
+      ? (data.response as Record<string, unknown>)
+      : data;
+    if (typeof response.status === "string" && response.status) {
+      if (response.status === "completed") {
+        return "stop";
+      }
+      if (response.status === "incomplete") {
+        const details = response.incomplete_details;
+        if (details && typeof details === "object") {
+          const reason = (details as Record<string, unknown>).reason;
+          if (reason === "max_output_tokens") {
+            return "length";
+          }
+          if (reason === "content_filter") {
+            return "content_filter";
+          }
+        }
+        return "incomplete";
+      }
+      if (response.status === "cancelled") {
+        return "cancelled";
+      }
+      if (response.status === "failed") {
+        return "error";
+      }
+      return response.status;
+    }
+    if (Array.isArray(response.choices) && response.choices[0] && typeof response.choices[0].finish_reason === "string") {
+      return response.choices[0].finish_reason;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function tryParseStreamedResponsesFinishReason(sseText: string): string | null {
+  const lines = sseText.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line) continue;
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    const reason = tryParseResponsesFinishReason(payload);
+    if (reason) return reason;
+  }
+  return "stop";
+}
+
+export function tryParseStreamedResponsesUsage(sseText: string): ParsedResponsesUsage | null {
+  let last: ParsedResponsesUsage | null = null;
+  const lines = sseText.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) {
+      continue;
+    }
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") {
+      continue;
+    }
+    let evt: Record<string, unknown> | null = null;
+    try {
+      evt = JSON.parse(payload) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const response = evt.response;
+    if (response && typeof response === "object") {
+      const candidate = tryParseResponsesUsage(JSON.stringify(response));
+      if (candidate) {
+        last = candidate;
+      }
+      continue;
+    }
+    const direct = tryParseResponsesUsage(payload);
+    if (direct) {
+      last = direct;
+    }
+  }
+  if (last) {
+    return last;
+  }
+  const trimmedBody = sseText.trim();
+  if (!trimmedBody) {
+    return null;
+  }
+  return tryParseResponsesUsage(trimmedBody);
+}
+
+function emitStreamCompletion(telemetry: ResponsesTelemetry, bytes: number, accumulatedText?: string): void {
+  const durationMs = Date.now() - telemetry.startTime;
+  logInfo(EMOJI.stats, `[STREAM-DONE ${telemetry.reqId}] bytes=${bytes} duration=${durationMs}ms`);
+  if (accumulatedText) {
+    const usage = tryParseStreamedResponsesUsage(accumulatedText);
+    if (usage) {
+      logUsage({
+        reqId: telemetry.reqId,
+        provider: telemetry.provider,
+        keyIndex: telemetry.keyIndex,
+        totalKeys: telemetry.totalKeys,
+        promptTokens: usage.promptTokens,
+        reasoningTokens: usage.reasoningTokens,
+        completionTokens: usage.completionTokens,
+        totalTokens: usage.totalTokens,
+        durationMs,
+      });
+    }
+    const finishReason = tryParseStreamedResponsesFinishReason(accumulatedText);
+    if (finishReason) {
+      logFinishReason(telemetry.reqId, finishReason);
+    }
+  } else {
+    logFinishReason(telemetry.reqId, "stop");
+  }
+  logServed(telemetry.reqId, durationMs, telemetry.status);
+  logSeparator();
+}
+
+function safeCloseController(controller: ReadableStreamDefaultController<Uint8Array>): void {
+  try {
+    controller.close();
+  } catch (err: unknown) {
+    logWarn(EMOJI.limit, `Controller close warning: ${err}`);
+  }
+}
+
+function releaseReaderLock(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    reader.releaseLock();
+  } catch (err: unknown) {
+    logWarn(EMOJI.limit, `Reader release lock warning: ${err}`);
+  }
+}
+
+async function readLoop(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  bytesRef?: { value: number },
+  textRef?: { value: string }
+): Promise<void> {
+  const decoder = textRef ? new TextDecoder() : null;
+  let reading = true;
+  while (reading) {
+    const { done, value } = await reader.read();
+    if (done) {
+      if (decoder) {
+        try {
+          const tail = decoder.decode();
+          if (tail && textRef) {
+            textRef.value += tail;
+          }
+        } catch (decodeErr: unknown) {
+          void decodeErr;
+        }
+      }
+      reading = false;
+      safeCloseController(controller);
+    } else if (value) {
+      if (bytesRef) {
+        bytesRef.value += value.byteLength;
+      }
+      if (textRef && decoder) {
+        try {
+          textRef.value += decoder.decode(value, { stream: true });
+          if (textRef.value.length > 1048576) {
+            textRef.value = textRef.value.slice(-262144);
+          }
+        } catch (chunkErr: unknown) {
+          void chunkErr;
+        }
+      }
+      controller.enqueue(value);
+    }
+  }
+}
+
+function setupAbortHandler(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  clientSignal?: AbortSignal,
+  abortController?: AbortController
+): () => void {
+  const onAbort = () => {
+    abortController?.abort();
+    void reader.cancel("aborted");
+    safeCloseController(controller);
+  };
+  if (clientSignal?.aborted) {
+    onAbort();
+  } else {
+    clientSignal?.addEventListener("abort", onAbort, { once: true });
+  }
+  return () => {
+    clientSignal?.removeEventListener("abort", onAbort);
+  };
+}
+
+function handleStreamError(
+  err: unknown,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  clientSignal?: AbortSignal
+): void {
+  if (clientSignal?.aborted) {
+    return;
+  }
+  logWarn(EMOJI.limit, `Stream pump error: ${err}`);
+  try {
+    controller.error(err);
+  } catch (controllerErr: unknown) {
+    logWarn(EMOJI.limit, `Controller error warning: ${controllerErr}`);
+  }
+}
+
+async function pumpStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  clientSignal?: AbortSignal,
+  abortController?: AbortController,
+  telemetry?: ResponsesTelemetry,
+  bytesRef?: { value: number },
+  textRef?: { value: string },
+  onComplete?: () => void
+): Promise<void> {
+  const cleanup = setupAbortHandler(reader, controller, clientSignal, abortController);
+  try {
+    await readLoop(reader, controller, bytesRef, textRef);
+    if (telemetry && bytesRef) {
+      emitStreamCompletion(telemetry, bytesRef.value, textRef?.value);
+    }
+  } catch (err: unknown) {
+    handleStreamError(err, controller, clientSignal);
+  } finally {
+    cleanup();
+    releaseReaderLock(reader);
+    onComplete?.();
+  }
+}
+
+export function createStreamingResponse(
+  upstreamResponse: Response,
+  clientSignal?: AbortSignal,
+  abortController?: AbortController,
+  telemetry?: ResponsesTelemetry,
+  pacerRelease?: () => void
+): Response {
+  if (upstreamResponse.status >= 400) {
+    pacerRelease?.();
+    return upstreamResponse;
+  }
+
+  let released = false;
+  const safeRelease = () => {
+    if (!released) {
+      released = true;
+      pacerRelease?.();
+    }
+  };
+
+  const upstreamBody = upstreamResponse.body;
+  if (!upstreamBody) {
+    safeRelease();
+    return new Response(null, {
+      status: upstreamResponse.status,
+      headers: buildSseHeaders(),
+    });
+  }
+
+  const reader = upstreamBody.getReader();
+  const bytesRef = { value: 0 };
+  const textRef = { value: "" };
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      void pumpStream(reader, controller, clientSignal, abortController, telemetry, bytesRef, textRef, safeRelease);
+    },
+    cancel(reason) {
+      safeRelease();
+      abortController?.abort();
+      return reader.cancel(reason);
+    },
+  });
+
+  return new Response(stream, {
+    status: upstreamResponse.status,
+    headers: buildSseHeaders(),
+  });
+}
+
+export async function createNonStreamingResponse(
+  upstreamResponse: Response,
+  telemetry?: ResponsesTelemetry
+): Promise<Response> {
+  const arrayBuffer = await upstreamResponse.arrayBuffer();
+  const sanitizedHeaders = sanitizeDownstreamHeaders(
+    upstreamResponse.headers,
+    arrayBuffer.byteLength
+  );
+  if (telemetry) {
+    const bodyText = new TextDecoder().decode(arrayBuffer);
+    emitNonStreamCompletion(telemetry, bodyText, arrayBuffer.byteLength);
+  }
+  return new Response(arrayBuffer, {
+    status: upstreamResponse.status,
+    headers: sanitizedHeaders,
+  });
+}
+
+export function shouldStreamResponse(
+  upstreamResponse: Response,
+  clientStreamRequested: boolean
+): boolean {
+  if (upstreamResponse.status >= 400) {
+    return false;
+  }
+  const contentType = upstreamResponse.headers.get("content-type") ?? "";
+  if (contentType.includes("text/event-stream")) {
+    return true;
+  }
+  return clientStreamRequested;
+}
+
+function extractProviderFromString(rawKey: string): string | null {
+  if (isRegisteredProvider(rawKey)) {
+    return rawKey.toLowerCase();
+  }
+  const validation = validateDirective(rawKey);
+  if (validation.valid && validation.directive.type === "direct") {
+    return validation.directive.provider;
+  }
+  return null;
+}
+
+export function extractProvider(
+  directiveOrRawKey: Directive | string
+): string | null {
+  if (typeof directiveOrRawKey === "string") {
+    return extractProviderFromString(directiveOrRawKey);
+  }
+  if (directiveOrRawKey && typeof directiveOrRawKey === "object" && "provider" in directiveOrRawKey) {
+    const p = directiveOrRawKey.provider;
+    return typeof p === "string" ? p : null;
+  }
+  return null;
+}
+
+interface ParsedRequestBody {
+  readonly bodyText: string;
+  readonly clientStream: boolean;
+  readonly body: {
+    readonly model?: string;
+    readonly [key: string]: unknown;
+  };
+}
+
+async function parseRequestBody(
+  req: Request
+): Promise<ParsedRequestBody> {
+  try {
+    const bodyText = await req.text();
+    if (!bodyText) {
+      return { bodyText: "", clientStream: false, body: {} };
+    }
+    const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+    const model = typeof parsed.model === "string" ? parsed.model : undefined;
+    return {
+      bodyText,
+      clientStream: Boolean(parsed.stream),
+      body: { ...parsed, model },
+    };
+  } catch (err: unknown) {
+    logWarn(EMOJI.limit, `Failed to inspect request body JSON: ${err}`);
+    return { bodyText: "", clientStream: false, body: {} };
+  }
+}
+
+interface UpstreamExecutionResult {
+  readonly response: Response;
+  readonly upstreamProtocol: OutboundProtocol;
+  readonly measuredTtftMs: number;
+}
+
+async function executeUpstreamFetch(
+  options: FetcherOptions
+): Promise<UpstreamExecutionResult> {
+  const guard = await fetchWithTtftGuard(options);
+  const reassembled = reassembleResponse(
+    guard.response,
+    guard.firstChunk,
+    guard.rawReader
+  );
+  return {
+    response: reassembled,
+    upstreamProtocol: guard.protocol,
+    measuredTtftMs: guard.ttftMs,
+  };
+}
+
+function resolveRequestRoute(
+  directiveOrRawKey: Directive | string,
+  state?: GatewayState
+): { route?: ResolvedRoute; errorResponse?: Response } {
+  const provider = extractProvider(directiveOrRawKey);
+  if (!provider || !isRegisteredProvider(provider)) {
+    return {
+      errorResponse: Response.json(
+        {
+          error: {
+            message: `Unsupported or invalid provider '${String(provider)}' for /v1/responses.`,
+            type: "invalid_request_error",
+          },
+        },
+        { status: 400 }
+      ),
+    };
+  }
+
+  const upstreamUrl = resolveUpstreamResponsesUrl(provider);
+  if (!upstreamUrl) {
+    return {
+      errorResponse: Response.json(
+        {
+          error: {
+            message: `No upstream responses endpoint configured for provider '${provider}'`,
+            type: "invalid_request_error",
+          },
+        },
+        { status: 400 }
+      ),
+    };
+  }
+
+  const selectedKey = resolveApiKey(provider, state);
+  if (!selectedKey) {
+    return {
+      errorResponse: Response.json(
+        {
+          error: {
+            message: `No active API keys available for provider '${provider}'`,
+            type: "insufficient_quota",
+          },
+        },
+        { status: 429 }
+      ),
+    };
+  }
+
+  return {
+    route: {
+      provider,
+      upstreamUrl,
+      key: selectedKey.key,
+      keyIndex: selectedKey.index,
+    },
+  };
+}
+
+interface PacerLeaseResult {
+  readonly errorResponse?: Response;
+  readonly release?: () => void;
+}
+
+async function acquireProviderRetryPacer(
+  provider: string,
+  signal?: AbortSignal,
+  reqId?: string
+): Promise<PacerLeaseResult> {
+  const env = getEnv();
+  const provConfig = isRegisteredProvider(provider) ? getProviderConfig(provider) : undefined;
+  if (!env.LITEROUTER_PACER_ENABLED || !(provConfig?.pacer?.enabled ?? false)) {
+    return {};
+  }
+  try {
+    const pacer = getPacerForProvider(provider);
+    const acquireResult = await pacer.acquire(signal);
+    return { release: acquireResult.release };
+  } catch (err: unknown) {
+    if (err instanceof PacerQueueOverflowError) {
+      logWarn(
+        EMOJI.hourglass,
+        `[PACER ${reqId ?? "unknown"}] ${provider.toUpperCase()} pacer queue overflow: ${err.message} (Retry-After: ${err.retryAfterSec}s)`
+      );
+      return {
+        errorResponse: Response.json(
+          {
+            error: {
+              message: err.message,
+              type: "rate_limit_exceeded",
+              code: "rate_limit_exceeded",
+            },
+          },
+          {
+            status: 429,
+            headers: {
+              "Retry-After": String(err.retryAfterSec),
+              "Content-Type": "application/json",
+            },
+          }
+        ),
+      };
+    }
+    throw err;
+  }
+}
+
+interface FetchResult {
+  readonly response?: Response;
+  readonly errorResponse?: Response;
+  readonly keyIndex?: number;
+  readonly upstreamProtocol?: OutboundProtocol;
+  readonly measuredTtftMs?: number;
+  readonly pacerRelease?: () => void;
+}
+
+async function dispatchUpstreamFetch(
+  route: ResolvedRoute,
+  bodyText: string,
+  clientHeaders: Headers,
+  signal: AbortSignal,
+  reqId: string,
+  model?: string
+): Promise<FetchResult> {
+  const env = getEnv();
+  const quarantineEnabled = globalKeyPool.isQuarantineEnabled(route.provider);
+  const poolSize = globalKeyPool.getPoolSize(route.provider);
+  const provConfig = isRegisteredProvider(route.provider) ? getProviderConfig(route.provider) : undefined;
+  const retriesEnabled = Boolean(provConfig?.request_retry?.enabled && provConfig.request_retry.max_attempts > 1);
+  const maxAttempts = provConfig?.request_retry?.enabled
+    ? Math.min(provConfig.request_retry.max_attempts, poolSize > 0 ? poolSize : 1)
+    : 1;
+  const maxWaitMs = provConfig?.pacer?.max_queue_wait_ms ?? (env.LITEROUTER_PACER_MAX_QUEUE_WAIT_MS || 300000);
+  const totalKeys = poolSize > 0 ? poolSize : 1;
+
+  let currentKey = route.key;
+  let currentKeyIndex = route.keyIndex;
+  const loopStart = Date.now();
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (signal.aborted) {
+      return {
+        errorResponse: Response.json(
+          { error: { message: "Request aborted by client", type: "client_closed_request" } },
+          { status: 499 }
+        ),
+      };
+    }
+
+    if (quarantineEnabled) {
+      const dwellMs = Date.now() - loopStart;
+      if (globalKeyPool.shouldLoadShed(route.provider, dwellMs, maxWaitMs)) {
+        const minTtl = globalKeyPool.getMinQuarantineTtlMs(route.provider);
+        const retryAfterSec = Math.max(1, Math.ceil(minTtl / 1000));
+        return {
+          errorResponse: Response.json(
+            { error: { message: `Provider '${route.provider}' unavailable: all keys in cooldown exceed wait budget.`, type: "service_unavailable" } },
+            { status: 503, headers: { "Retry-After": String(retryAfterSec) } }
+          ),
+        };
+      }
+    }
+
+    const pacerResult = await acquireProviderRetryPacer(route.provider, signal, reqId);
+    if (pacerResult.errorResponse) {
+      return { errorResponse: pacerResult.errorResponse };
+    }
+
+    if (attempt > 1) {
+      const next = globalKeyPool.selectNextKey(route.provider);
+      if (!next) {
+        pacerResult.release?.();
+        const minTtl = globalKeyPool.getMinQuarantineTtlMs(route.provider);
+        logExhausted(reqId, route.provider, minTtl);
+        return {
+          errorResponse: Response.json(
+            {
+              error: {
+                message: `All API keys for provider '${route.provider}' are cooling down.`,
+                type: "insufficient_quota",
+              },
+            },
+            { status: 429 }
+          ),
+        };
+      }
+      logRotate(reqId, route.provider, currentKeyIndex, next.index, next.totalKeys, attempt, maxAttempts);
+      currentKey = next.key;
+      currentKeyIndex = next.index;
+    }
+
+    const upstreamHeaders = buildUpstreamHeaders(currentKey, route.provider, clientHeaders);
+    let execResult: UpstreamExecutionResult;
+    try {
+      const fetchOpts: FetcherOptions = {
+        url: route.upstreamUrl,
+        method: "POST",
+        headers: upstreamHeaders,
+        body: bodyText.length > 0 ? bodyText : undefined,
+        clientSignal: signal,
+        provider: route.provider,
+        keyIndex: currentKeyIndex,
+        model,
+      };
+      execResult = await executeUpstreamFetch(fetchOpts);
+    } catch (err: unknown) {
+      if (isFatalAuthError(err)) {
+        pacerResult.release?.();
+        logWarn(
+          EMOJI.zap,
+          `[${route.provider.toUpperCase()} ${reqId}] Fatal auth error ${err.status}: failing fast and loud without retry.`
+        );
+        return {
+          errorResponse: Response.json(
+            { error: { message: err.message, type: "authentication_error" } },
+            { status: err.status }
+          ),
+        };
+      }
+      if (quarantineEnabled) {
+        globalKeyPool.reportFailure(route.provider, currentKeyIndex, 502);
+      } else {
+        logWarn(EMOJI.zap, `[${route.provider.toUpperCase()} ${reqId}] Dumb-forwarder mode: Key ${currentKeyIndex} quarantine bypassed.`);
+      }
+      if (retriesEnabled && attempt < maxAttempts && !signal.aborted) {
+        pacerResult.release?.();
+        logWarn(EMOJI.zap, `[${route.provider.toUpperCase()} ${reqId}] Transport error on attempt ${attempt}/${maxAttempts}, rotating key...`);
+        const delayMs = provConfig ? calculateRetryDelay(provConfig.request_retry.delay, attempt) : 0;
+        if (delayMs > 0) {
+          await Bun.sleep(delayMs);
+        }
+        continue;
+      }
+      pacerResult.release?.();
+      logError(reqId, `Upstream request to ${route.upstreamUrl} failed`, err);
+      return {
+        errorResponse: Response.json(
+          {
+            error: {
+              message: `Upstream request failed: ${extractErrorMessage(String(err)) ?? String(err)}`,
+              type: "server_error",
+            },
+          },
+          { status: 502 }
+        ),
+      };
+    }
+
+    const res = execResult.response;
+    if (res.status < 400) {
+      globalKeyPool.reportSuccess(route.provider, currentKeyIndex);
+      return {
+        response: res,
+        keyIndex: currentKeyIndex,
+        upstreamProtocol: execResult.upstreamProtocol,
+        measuredTtftMs: execResult.measuredTtftMs,
+        pacerRelease: pacerResult.release,
+      };
+    }
+
+    const errBodyText = await res.clone().text().catch(() => "");
+    if (res.status === 401 || res.status === 403) {
+      pacerResult.release?.();
+      logWarn(
+        EMOJI.zap,
+        `[${route.provider.toUpperCase()} ${reqId}] Fatal auth error ${res.status}: failing fast and loud without retry.`
+      );
+      try {
+        if (quarantineEnabled) {
+          globalKeyPool.reportFailure(route.provider, currentKeyIndex, res.status, res.headers, errBodyText);
+        }
+      } catch (err: unknown) {
+        if (isFatalAuthError(err)) {
+          logWarn(EMOJI.zap, `[${route.provider.toUpperCase()} ${reqId}] Auth failure confirmed fatal: ${err.message}`);
+        } else {
+          throw err;
+        }
+      }
+      return { response: res, keyIndex: currentKeyIndex };
+    }
+
+    const classification = classifyUpstreamError({
+      provider: route.provider,
+      status: res.status,
+      headers: res.headers,
+      bodyText: errBodyText,
+    });
+    try {
+      if (quarantineEnabled && classification.quarantineTtlSec > 0) {
+        globalKeyPool.reportFailure(route.provider, currentKeyIndex, res.status, res.headers, errBodyText, Date.now(), classification.quarantineTtlSec);
+      } else if (classification.quarantineTtlSec > 0) {
+        logWarn(EMOJI.zap, `[${route.provider.toUpperCase()} ${reqId}] Dumb-forwarder mode (${route.provider.toUpperCase()}_ENABLE_QUARANTINE=false): Key ${currentKeyIndex} quarantine bypassed.`);
+      }
+    } catch (err: unknown) {
+      if (isFatalAuthError(err)) {
+        pacerResult.release?.();
+        logWarn(
+          EMOJI.zap,
+          `[${route.provider.toUpperCase()} ${reqId}] Fatal auth error ${err.status}: failing fast and loud without retry.`
+        );
+        return { response: res, keyIndex: currentKeyIndex };
+      }
+      throw err;
+    }
+
+    const canRetry =
+      retriesEnabled &&
+      classification.action === "retry_rotate" &&
+      attempt < maxAttempts &&
+      !signal.aborted;
+    if (canRetry) {
+      pacerResult.release?.();
+      const ttlSec = quarantineEnabled && classification.quarantineTtlSec > 0
+        ? classification.quarantineTtlSec
+        : undefined;
+      logLimit(reqId, route.provider, currentKeyIndex, res.status, ttlSec, totalKeys, extractErrorMessage(errBodyText));
+      const delayMs = provConfig ? calculateRetryDelay(provConfig.request_retry.delay, attempt) : 0;
+      if (delayMs > 0) {
+        await Bun.sleep(delayMs);
+      }
+      continue;
+    }
+
+    if (!retriesEnabled && classification.action === "retry_rotate") {
+      logWarn(EMOJI.zap, `[${route.provider.toUpperCase()} ${reqId}] Single-flight mode: Passing HTTP ${res.status} directly downstream.`);
+    }
+    pacerResult.release?.();
+    return { response: res, keyIndex: currentKeyIndex };
+  }
+
+  logError(reqId, `${route.provider} Responses request attempts exhausted`, null);
+  return {
+    errorResponse: Response.json(
+      { error: { message: `${route.provider} Responses request attempts exhausted`, type: "gateway_error" } },
+      { status: 502 }
+    ),
+  };
+}
+
+function extractReqContext(stateOrReqId?: GatewayState | string): {
+  reqId: string;
+  state?: GatewayState;
+} {
+  if (typeof stateOrReqId === "string") {
+    return { reqId: stateOrReqId };
+  }
+  return {
+    reqId: `req_${Math.random().toString(36).slice(2, 9)}`,
+    state: stateOrReqId,
+  };
+}
+
+function createClientAbortedResponse(): Response {
+  return Response.json(
+    { error: { message: "Request aborted by client", type: "client_closed_request" } },
+    { status: 499 }
+  );
+}
+
+function bindAbortSignal(
+  clientSignal: AbortSignal,
+  abortController: AbortController
+): () => void {
+  const onAbort = () => abortController.abort();
+  clientSignal.addEventListener("abort", onAbort, { once: true });
+  return () => clientSignal.removeEventListener("abort", onAbort);
+}
+
+function resolveDirectiveString(
+  directiveOrRawKey: Directive | string,
+  fallback: string
+): string {
+  if (typeof directiveOrRawKey === "string") {
+    return directiveOrRawKey;
+  }
+  return typeof directiveOrRawKey.raw === "string"
+    ? directiveOrRawKey.raw
+    : fallback;
+}
+
+export async function handleOpenAiOriginal(
+  req: Request,
+  directive: Directive,
+  state?: GatewayState
+): Promise<Response>;
+export async function handleOpenAiOriginal(
+  req: Request,
+  rawKey: string,
+  stateOrReqId?: GatewayState | string
+): Promise<Response>;
+export async function handleOpenAiOriginal(
+  req: Request,
+  directiveOrRawKey: Directive | string,
+  stateOrReqId?: GatewayState | string
+): Promise<Response> {
+  const { reqId, state } = extractReqContext(stateOrReqId);
+  const routeResult = resolveRequestRoute(directiveOrRawKey, state);
+  if (routeResult.errorResponse) {
+    return routeResult.errorResponse;
+  }
+  const route = routeResult.route as ResolvedRoute;
+
+  if (req.signal.aborted) {
+    return createClientAbortedResponse();
+  }
+
+  const { bodyText, clientStream, body } = await parseRequestBody(req);
+  let activeBodyText = bodyText;
+  let zenRequiresAccumulation = false;
+  const strategyIsZen = isRegisteredProvider(route.provider) && getProviderConfig(route.provider)?.strategy === "zen";
+  if (strategyIsZen) {
+    const { adaptZenResponsesPayload } = require("../engine/zen");
+    const adapted = adaptZenResponsesPayload(body);
+    zenRequiresAccumulation = adapted.requiresAccumulation;
+    activeBodyText = JSON.stringify(adapted.adaptedBody);
+  }
+  const directiveStr = resolveDirectiveString(directiveOrRawKey, route.provider);
+  const method = req.method;
+  const path = new URL(req.url, "http://localhost").pathname;
+  const clientAgent = req.headers.get("user-agent") ?? "unknown";
+  const clientProtocol = req.headers.get("x-http-version") ?? "HTTP/1.1";
+  const targetProvider = route.provider;
+  const totalKeys = globalKeyPool.getPoolSize(route.provider);
+  const refHeaders = resolveUpstreamEndpoint(route.provider, "ch", body.model ?? "").headers;
+  const refUa = refHeaders?.["User-Agent"];
+  const refUrl = refHeaders?.["HTTP-Referer"] ?? refHeaders?.["Referer"];
+  const referrer = refUa && refUrl ? `${refUa} @ ${refUrl}` : (refUa ?? refUrl ?? undefined);
+
+  logInbound({
+    reqId,
+    method,
+    path,
+    clientAgent,
+    protocol: clientProtocol,
+    directiveStr,
+    targetProvider,
+    wireFormat: "rs",
+    endpoint: "/v1/responses",
+    model: body.model,
+    keyIndex: route.keyIndex,
+    totalKeys,
+    nuances: extractDirectiveNuances(directiveOrRawKey),
+    referrer,
+  });
+
+  logPrepLine(reqId, body.model, activeBodyText.length, extractReasoningEffort(body), clientStream);
+
+  const abortController = new AbortController();
+  const cleanup = bindAbortSignal(req.signal, abortController);
+
+  const startTime = Date.now();
+  const fetchResult = await dispatchUpstreamFetch(
+    route,
+    activeBodyText,
+    req.headers,
+    abortController.signal,
+    reqId,
+    body.model
+  );
+  if (fetchResult.errorResponse) {
+    cleanup();
+    return req.signal.aborted ? createClientAbortedResponse() : fetchResult.errorResponse;
+  }
+
+  const ttftMs = Date.now() - startTime;
+  const upstreamRes = fetchResult.response as Response;
+  const isStream = shouldStreamResponse(upstreamRes, clientStream);
+  if (upstreamRes.status >= 400) {
+    await logUpstreamError(reqId, route, totalKeys, upstreamRes);
+  } else {
+    logUpstreamLine(reqId, route.provider, route.upstreamUrl, isStream);
+  }
+  const actualUpstreamProtocol = fetchResult.upstreamProtocol ?? "HTTP/1.1";
+  const effectiveTtftMs = fetchResult.measuredTtftMs ?? ttftMs;
+  logTtft(
+    reqId,
+    effectiveTtftMs,
+    isStream ? "Stream established" : "First chunk streamed downstream",
+    actualUpstreamProtocol
+  );
+
+  const telemetry: ResponsesTelemetry = {
+    reqId,
+    provider: route.provider,
+    keyIndex: fetchResult.keyIndex ?? route.keyIndex,
+    totalKeys,
+    startTime,
+    status: upstreamRes.status,
+  };
+
+  if (upstreamRes.status >= 400) {
+    cleanup();
+    fetchResult.pacerRelease?.();
+    return upstreamRes;
+  }
+
+  const isEventStream = (upstreamRes.headers.get("content-type") ?? "").includes("text/event-stream");
+  if (zenRequiresAccumulation && isEventStream && upstreamRes.body) {
+    cleanup();
+    fetchResult.pacerRelease?.();
+    const { accumulateZenResponsesStream } = require("../engine/zen");
+    const accumulated = await accumulateZenResponsesStream(upstreamRes.body);
+    return Response.json(accumulated, {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  if (isStream) {
+    return createStreamingResponse(
+      upstreamRes,
+      req.signal,
+      abortController,
+      telemetry,
+      fetchResult.pacerRelease
+    );
+  }
+
+  cleanup();
+  fetchResult.pacerRelease?.();
+  return createNonStreamingResponse(upstreamRes, telemetry);
+}

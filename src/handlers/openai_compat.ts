@@ -1,0 +1,1329 @@
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { loadKeyPools } from "../config/keys";
+import type { DirectDirective, ParsedDirective } from "../directive/parser";
+import { parseDirective } from "../directive/parser";
+import { createUnauthorizedResponse, validateDirective } from "../directive/validator";
+import { FusionEngine } from "../fusion/engine";
+import { classifyTransportError, classifyUpstreamError, type ErrorDisposition } from "../network/classifier";
+import { CooldownManager } from "../network/cooldown";
+import {
+  createResilientStream,
+  fetchWithTtftGuard,
+  type FetcherOptions,
+  NoResponseError,
+  sanitizeDownstreamHeaders,
+} from "../network/fetcher";
+import { FatalAuthError, isFatalAuthError, KeyPool, type SelectedKey } from "../network/pool";
+import { sanitizeAndTransformPayload } from "../transformers/payload";
+import type { OpenAIRequestPayload } from "../transformers/nuances";
+export type { OpenAIRequestPayload };
+import { createDotsStreamTransformer, parseDotsXml, stripLeakedTemplateTags } from "../transformers/dots";
+import { createLingStreamTransformer, parseLingXml, transformLingResponse } from "../transformers/ling";
+import {
+  createResponsesStreamTransformer,
+  transformOpenAiToResponses,
+  transformResponsesToOpenAi,
+} from "../transformers/responses";
+
+import type { FusionConfig, FusionTier, ProviderConfigEntry } from "../config/schema";
+import {
+  getProviderConfig,
+  isRegisteredProvider,
+  initProviderRegistry,
+  getAllProviders,
+  overrideProviderUrl,
+  resolveUpstreamEndpoint,
+} from "../config/providers";
+import { getEnv } from "../config/env";
+import { getPacerForProvider, PacerQueueOverflowError, type PacerAcquireResult } from "../network/pacer";
+import {
+  EMOJI,
+  extractErrorMessage,
+  formatTimestamp,
+  getProviderDisplayName,
+  logError,
+  logExhausted,
+  logFinishReason,
+  logInbound,
+  logLimit,
+  logRotate,
+  logSeparator,
+  logServed,
+  logTtft,
+  logUsage,
+  logWarn,
+  type UsageLogDetails,
+} from "../ui/logger";
+import type { ConserveRule } from "../network/cooldown";
+import {
+  DEFAULT_MAX_CONTEXT_TOKENS,
+  DEFAULT_SAFE_CONTEXT_TOKENS,
+  estimateOpenAITokens,
+  extractContextLimit,
+  isContextLengthError,
+  pruneOpenAIPayload,
+} from "../transformers/context_pruner";
+import {
+  storeThoughtSignaturesFromResponse,
+  createThoughtSignatureStreamTap,
+} from "../transformers/thinking";
+import { ensureSessionHeaders, extractClientSessionId, generateOpenCodeSessionId } from "../engine/session_id";
+import {
+  buildZenHeaders,
+  adaptZenPayload,
+  accumulateZenStreamToCompletion,
+} from "../engine/zen";
+
+export interface ProviderEndpointConfig extends Omit<ProviderConfigEntry, "conserve_rules"> {
+  readonly conserve_rules?: readonly ConserveRule[];
+}
+
+let cachedFusionEngine: FusionEngine | null = null;
+
+export function resetCachedFusionEngine(): void {
+  cachedFusionEngine = null;
+}
+
+export function getCachedFusionEngine(): FusionEngine {
+  if (!cachedFusionEngine) {
+    cachedFusionEngine = new FusionEngine(loadFusionConfig());
+  }
+  return cachedFusionEngine;
+}
+
+export const getFusionEngine = getCachedFusionEngine;
+
+export function resetProvidersRegistryCache(): void {
+  initProviderRegistry();
+  resetCachedFusionEngine();
+}
+
+export function getProviderEndpointConfig(providerCode: string): ProviderEndpointConfig | undefined {
+  return isRegisteredProvider(providerCode)
+    ? (getProviderConfig(providerCode) as unknown as ProviderEndpointConfig)
+    : undefined;
+}
+
+export { overrideProviderUrl, resolveUpstreamEndpoint, ensureSessionHeaders, extractClientSessionId };
+
+function generateZenSessionId(): string {
+  return generateOpenCodeSessionId();
+}
+
+export function buildAuthHeaders(
+  authHeader: "Bearer" | "x-api-key",
+  key: string,
+  provider?: string,
+  incomingHeaders?: Headers | Record<string, string>
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept-Encoding": "identity",
+  };
+  if (authHeader === "x-api-key") {
+    headers["x-api-key"] = key;
+    headers["anthropic-version"] = "2023-06-01";
+  } else {
+    headers["Authorization"] = `Bearer ${key}`;
+  }
+  if (provider === "gg") {
+    headers["x-goog-api-key"] = key;
+  }
+  if (provider) {
+    const norm = provider.toLowerCase();
+    const entry = getAllProviders().find(
+      (p) => p.code.toLowerCase() === norm || p.name?.toLowerCase() === norm
+    );
+    if (entry?.headers) {
+      Object.assign(headers, entry.headers);
+    }
+  }
+  if (incomingHeaders) {
+    const entries =
+      typeof (incomingHeaders as Headers).entries === "function"
+        ? (incomingHeaders as Headers).entries()
+        : Object.entries(incomingHeaders);
+    for (const [k, v] of entries) {
+      const lower = k.toLowerCase();
+      if (lower === "x-client-version" || lower === "x-client-name") {
+        headers[k] = v;
+      }
+    }
+  }
+  ensureSessionHeaders(headers, incomingHeaders);
+  if (provider === "zn" || provider === "zen") {
+    const { buildZenHeaders } = require("../engine/zen");
+    const zenHeaders = buildZenHeaders(incomingHeaders, headers["session-id"]);
+    Object.assign(headers, zenHeaders);
+  }
+  return headers;
+}
+
+export const globalCooldownManager = new CooldownManager();
+export const globalKeyPool = new KeyPool(globalCooldownManager);
+
+export function initializeKeyPools(envSource: Record<string, string | undefined> = process.env): void {
+  const pools = loadKeyPools(envSource);
+  for (const [code, keys] of pools.entries()) {
+    if (keys.length > 0) {
+      globalKeyPool.setPool(code, keys);
+    } else {
+      globalKeyPool.setPool(code, [`sk-stub-${code}-mock-key-1`]);
+    }
+  }
+}
+
+function mergeUint8Arrays(chunks: readonly Uint8Array[], totalLength: number): Uint8Array {
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+async function collectFullBody(
+  firstChunk: Uint8Array,
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [firstChunk];
+  let totalLength = firstChunk.length;
+  let reading = true;
+
+  while (reading) {
+    const { done, value } = await reader.read();
+    if (done) {
+      reading = false;
+    } else if (value) {
+      chunks.push(value);
+      totalLength += value.length;
+    }
+  }
+  return mergeUint8Arrays(chunks, totalLength);
+}
+
+export class UpstreamRetryableError extends Error {
+  public readonly status: number;
+  public readonly classification: ErrorDisposition;
+
+  public constructor(message: string, status: number, classification: ErrorDisposition) {
+    super(message);
+    this.name = "UpstreamRetryableError";
+    this.status = status;
+    this.classification = classification;
+  }
+}
+
+export interface RequestClientOptions {
+  readonly userAgent?: string;
+  readonly headers?: Headers | Record<string, string | string[] | undefined>;
+  readonly filterReasoning?: boolean;
+}
+
+
+
+export function parseRetryAfterHeader(headers: Headers): number | undefined {
+  const ra = headers.get("retry-after");
+  if (!ra) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(ra, 10);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+async function executeDirectCall(
+  directive: DirectDirective,
+  payload: OpenAIRequestPayload,
+  clientSignal: AbortSignal | undefined,
+  selected: SelectedKey,
+  reqId: string,
+  attempt: number,
+  maxAttempts: number,
+  clientOptions?: RequestClientOptions
+): Promise<Response> {
+  const env = getEnv();
+  const provConfig = isRegisteredProvider(directive.provider)
+    ? getProviderConfig(directive.provider)
+    : undefined;
+  const isSingleFlight = !(provConfig?.request_retry?.enabled ?? true);
+
+  let activePayload = payload;
+  let zenRequiresAccumulation = false;
+  if ((directive.provider === "or" || (directive.provider as string) === "openrouter") && payload.model.startsWith("openrouter/")) {
+    activePayload = {
+      ...payload,
+      model: payload.model.slice("openrouter/".length),
+    };
+  } else if (directive.provider === "zn" || (directive.provider as string) === "zen") {
+    const adapted = adaptZenPayload(activePayload);
+    activePayload = adapted.adaptedBody as OpenAIRequestPayload;
+    zenRequiresAccumulation = adapted.requiresAccumulation;
+  }
+
+  const endpoint = resolveUpstreamEndpoint(directive.provider, directive.completion, activePayload.model);
+  const clientHdrs = clientOptions?.headers instanceof Headers
+    ? clientOptions.headers
+    : (clientOptions?.headers ? new Headers(clientOptions.headers as Record<string, string>) : undefined);
+  const headers = buildAuthHeaders(endpoint.authHeader, selected.key, directive.provider, clientHdrs);
+  if (directive.provider === "zn" || (directive.provider as string) === "zen") {
+    const { scrubZenHeaders, buildZenHeaders } = require("../engine/zen");
+    scrubZenHeaders(headers);
+    Object.assign(headers, buildZenHeaders(clientHdrs));
+  }
+  const isResponses = directive.completion === "rs";
+  const outboundBody = isResponses
+    ? JSON.stringify(transformOpenAiToResponses(activePayload))
+    : JSON.stringify(activePayload);
+
+  const fetchOpts: FetcherOptions = {
+    url: endpoint.url,
+    method: "POST",
+    headers,
+    body: outboundBody,
+    clientSignal,
+    provider: directive.provider,
+    keyIndex: selected.index,
+    model: activePayload.model,
+  };
+
+  const startTime = Date.now();
+  const { response, ttftMs, firstChunk, rawReader, protocol } = await fetchWithTtftGuard(fetchOpts);
+  const duration = Date.now() - startTime;
+
+  const isStream = Boolean(payload.stream);
+
+  if (response.status >= 400) {
+    const fullBody = await collectFullBody(firstChunk, rawReader);
+    const bodyText = new TextDecoder().decode(fullBody);
+    const providerConfig = getProviderEndpointConfig(directive.provider);
+    const classification = classifyUpstreamError({
+      provider: directive.provider,
+      status: response.status,
+      headers: response.headers,
+      bodyText,
+      conserveRules: providerConfig?.conserve_rules,
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      try {
+        globalKeyPool.reportFailure(
+          directive.provider,
+          selected.index,
+          response.status,
+          response.headers,
+          bodyText,
+          Date.now(),
+          classification.quarantineTtlSec
+        );
+      } catch (authErr: unknown) {
+        if (!isFatalAuthError(authErr)) {
+          throw authErr;
+        }
+      }
+
+      logLimit(reqId, directive.provider, selected.index, response.status, undefined, selected.totalKeys, extractErrorMessage(bodyText));
+      logServed(reqId, duration, response.status, attempt, maxAttempts);
+      logSeparator();
+
+      if (fullBody.byteLength > 0) {
+        return new Response(fullBody.buffer as ArrayBuffer, {
+          status: response.status,
+          headers: sanitizeDownstreamHeaders(response.headers, fullBody.byteLength),
+        });
+      }
+
+      return Response.json(
+        {
+          error: {
+            message: `Fatal authentication failure (HTTP ${response.status}) for provider "${directive.provider}" key index ${selected.index}`,
+            type: "authentication_error",
+            code: response.status,
+          },
+        },
+        {
+          status: response.status,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    const quarantineEnabled = globalKeyPool.isQuarantineEnabled(directive.provider);
+    if (classification.isConserve && classification.quarantineTtlSec > 0) {
+      globalKeyPool.conserveKey(
+        directive.provider,
+        selected.index,
+        classification.quarantineTtlSec,
+        classification.reason,
+        response.status
+      );
+      console.warn(
+        `${EMOJI.limit} ${formatTimestamp()} [CONSERVE ${reqId}] ${getProviderDisplayName(directive.provider)} [Key #${selected.index + 1}/${selected.totalKeys}] matched conserve rule "${classification.reason}" -> Parked for ${classification.quarantineTtlSec}s`
+      );
+    } else if (quarantineEnabled && classification.quarantineTtlSec > 0) {
+      globalKeyPool.reportFailure(
+        directive.provider,
+        selected.index,
+        response.status,
+        response.headers,
+        bodyText,
+        Date.now(),
+        classification.quarantineTtlSec
+      );
+    } else if (!quarantineEnabled && classification.quarantineTtlSec > 0) {
+      logWarn(EMOJI.zap, `[${directive.provider.toUpperCase()} ${reqId}] Dumb-forwarder mode (${directive.provider.toUpperCase()}_ENABLE_QUARANTINE=false): Key ${selected.index} quarantine bypassed.`);
+    }
+
+    if (!classification.isConserve) {
+      const rawErrorMsg = extractErrorMessage(bodyText);
+      const ttlSec = !quarantineEnabled || classification.quarantineTtlSec === 0
+        ? undefined
+        : classification.quarantineTtlSec;
+      logLimit(reqId, directive.provider, selected.index, response.status, ttlSec, selected.totalKeys, rawErrorMsg);
+    }
+
+    if (isContextLengthError(response.status, bodyText) && !clientSignal?.aborted) {
+      const detectedLimit = extractContextLimit(bodyText);
+      const targetLimit = detectedLimit ? Math.floor(detectedLimit * 0.75) : DEFAULT_SAFE_CONTEXT_TOKENS;
+      const pruned = pruneOpenAIPayload(payload, targetLimit);
+      if (pruned.messages.length < payload.messages.length || estimateOpenAITokens(pruned) < estimateOpenAITokens(payload)) {
+        logWarn(EMOJI.prune, `[PRUNE ${reqId}] Context length exceeded upstream (${detectedLimit ?? "unknown"} tokens). Auto-pruned message turns and retrying...`);
+        return executeDirectCall(directive, pruned, clientSignal, selected, reqId, attempt, maxAttempts, clientOptions);
+      }
+    }
+
+    const retriesEnabled = !isSingleFlight;
+    const canRetry =
+      (classification.isConserve || retriesEnabled) &&
+      classification.action === "retry_rotate" &&
+      attempt < maxAttempts &&
+      !clientSignal?.aborted;
+    if (canRetry) {
+      throw new UpstreamRetryableError(
+        `Upstream error ${response.status}: ${classification.reason}`,
+        response.status,
+        classification
+      );
+    }
+
+    if (isSingleFlight && classification.action === "retry_rotate") {
+      logWarn(
+        EMOJI.zap,
+        `[${directive.provider.toUpperCase()} ${reqId}] Single-flight mode: Passing HTTP ${response.status} directly downstream.`
+      );
+    }
+
+    logServed(reqId, duration, response.status, attempt, maxAttempts);
+    logSeparator();
+
+    return new Response(fullBody.buffer as ArrayBuffer, {
+      status: response.status,
+      headers: sanitizeDownstreamHeaders(response.headers, fullBody.byteLength),
+    });
+  }
+
+  globalKeyPool.reportSuccess(directive.provider, selected.index);
+  logTtft(reqId, ttftMs, isStream ? "Stream established" : "First chunk streamed downstream", protocol);
+
+  const isLing =
+    directive.nuances.includes("lg") ||
+    Boolean(payload.model && payload.model.toLowerCase().includes("ling"));
+
+  const isXmlTranslationActive =
+    directive.nuances.includes("tc") ||
+    Boolean(payload.model && payload.model.toLowerCase().includes("dots"));
+
+  if (!isStream) {
+    let finalBody: Uint8Array;
+    let json: Record<string, unknown> | null = null;
+    if (zenRequiresAccumulation) {
+      let firstChunkYielded = false;
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          if (!firstChunkYielded) {
+            firstChunkYielded = true;
+            if (firstChunk.byteLength > 0) {
+              controller.enqueue(firstChunk);
+              return;
+            }
+          }
+          try {
+            const { done, value } = await rawReader.read();
+            if (done) {
+              controller.close();
+            } else if (value) {
+              controller.enqueue(value);
+            }
+          } catch (err: unknown) {
+            controller.error(err);
+          }
+        },
+        cancel(reason) {
+          return rawReader.cancel(reason);
+        },
+      });
+      const completion = await accumulateZenStreamToCompletion(stream, activePayload.model);
+      finalBody = new TextEncoder().encode(JSON.stringify(completion));
+      json = completion;
+    } else {
+      const fullBody = await collectFullBody(firstChunk, rawReader);
+      finalBody = fullBody;
+      try {
+        const decoded = new TextDecoder().decode(fullBody);
+        json = JSON.parse(decoded) as Record<string, unknown>;
+      } catch (parseErr) {
+        void parseErr;
+      }
+    }
+
+    try {
+      if (json && !zenRequiresAccumulation) {
+        if (isResponses) {
+          const transformedResponse = transformResponsesToOpenAi(json, activePayload.model);
+          finalBody = new TextEncoder().encode(JSON.stringify(transformedResponse));
+        } else {
+          const choice = (json.choices as Array<{ message?: { content?: string | null; reasoning_content?: string | null; thought?: string | null; tool_calls?: unknown }; finish_reason?: string }>)?.[0];
+          if (choice?.message && isLing) {
+            const transformedResponse = transformLingResponse(json);
+            finalBody = new TextEncoder().encode(JSON.stringify(transformedResponse));
+          } else if (choice?.message && isXmlTranslationActive) {
+            let msgModified = false;
+            if (typeof choice.message.content === "string") {
+              const { cleanText, toolCalls, reasoningContent } = parseDotsXml(choice.message.content);
+              if (toolCalls.length > 0 || cleanText !== choice.message.content || reasoningContent) {
+                choice.message.content = cleanText || null;
+                if (toolCalls.length > 0) {
+                  choice.message.tool_calls = toolCalls;
+                  choice.finish_reason = "tool_calls";
+                }
+                if (reasoningContent && !choice.message.reasoning_content) {
+                  choice.message.reasoning_content = reasoningContent;
+                }
+                msgModified = true;
+              }
+            }
+            if (typeof choice.message.reasoning_content === "string") {
+              const cleaned = stripLeakedTemplateTags(choice.message.reasoning_content);
+              if (cleaned !== choice.message.reasoning_content) {
+                choice.message.reasoning_content = cleaned || null;
+                msgModified = true;
+              }
+            }
+            if (typeof choice.message.thought === "string") {
+              const cleaned = stripLeakedTemplateTags(choice.message.thought);
+              if (cleaned !== choice.message.thought) {
+                choice.message.thought = cleaned || null;
+                msgModified = true;
+              }
+            }
+            if (msgModified) {
+              finalBody = new TextEncoder().encode(JSON.stringify(json));
+            }
+          }
+        }
+      }
+
+      if (json) {
+        storeThoughtSignaturesFromResponse(json);
+        const choiceForFinish = isResponses
+          ? { finish_reason: "stop" }
+          : (json.choices as Array<{ finish_reason?: string | null }>)?.[0];
+        if (choiceForFinish?.finish_reason) {
+          logFinishReason(reqId, choiceForFinish.finish_reason);
+        }
+
+        if (json.usage && typeof json.usage === "object") {
+          const u = json.usage as Record<string, unknown>;
+          const promptTokens = typeof u.prompt_tokens === "number"
+            ? u.prompt_tokens
+            : typeof u.input_tokens === "number"
+            ? u.input_tokens
+            : 0;
+          const completionTokens = typeof u.completion_tokens === "number"
+            ? u.completion_tokens
+            : typeof u.output_tokens === "number"
+            ? u.output_tokens
+            : 0;
+          const totalTokens = typeof u.total_tokens === "number" ? u.total_tokens : promptTokens + completionTokens;
+          let reasoningTokens: number | undefined;
+          if (u.completion_tokens_details && typeof u.completion_tokens_details === "object") {
+            const details = u.completion_tokens_details as Record<string, unknown>;
+            if (typeof details.reasoning_tokens === "number") {
+              reasoningTokens = details.reasoning_tokens;
+            }
+          } else if (u.output_tokens_details && typeof u.output_tokens_details === "object") {
+            const details = u.output_tokens_details as Record<string, unknown>;
+            if (typeof details.reasoning_tokens === "number") {
+              reasoningTokens = details.reasoning_tokens;
+            }
+          }
+          logUsage({
+            reqId,
+            provider: directive.provider,
+            keyIndex: selected.index,
+            totalKeys: selected.totalKeys,
+            promptTokens,
+            reasoningTokens,
+            completionTokens,
+            totalTokens,
+            durationMs: duration,
+          });
+        }
+      }
+    } catch (parseErr) {
+      void parseErr;
+    }
+
+    logServed(reqId, duration, response.status, attempt, maxAttempts);
+    logSeparator();
+
+    return new Response(finalBody.buffer as ArrayBuffer, {
+      status: response.status,
+      headers: sanitizeDownstreamHeaders(response.headers, finalBody.byteLength),
+    });
+  }
+
+  let currentKeyIndex = selected.index;
+  let currentAttempt = attempt;
+
+  let resilientStream = createResilientStream(firstChunk, rawReader, {
+    protocol: "openai",
+    onUsage: (u) => {
+      const streamDuration = Date.now() - startTime;
+      logUsage({
+        reqId,
+        provider: directive.provider,
+        keyIndex: currentKeyIndex,
+        totalKeys: selected.totalKeys,
+        promptTokens: u.promptTokens,
+        reasoningTokens: u.reasoningTokens,
+        completionTokens: u.completionTokens,
+        totalTokens: u.totalTokens,
+        durationMs: streamDuration,
+      });
+      logServed(reqId, streamDuration, response.status, currentAttempt, maxAttempts);
+      logSeparator();
+    },
+    onFinishReason: (finishReason) => {
+      logFinishReason(reqId, finishReason);
+    },
+    retryProvider: async (reason: string, _hasEmittedTokens?: boolean) => {
+      const classification = classifyTransportError(reason);
+      const midQuarantineEnabled = globalKeyPool.isQuarantineEnabled(directive.provider);
+      if (midQuarantineEnabled && classification.quarantineTtlSec > 0) {
+        globalKeyPool.reportFailure(directive.provider, currentKeyIndex, 500, undefined, reason, Date.now(), classification.quarantineTtlSec);
+      } else if (!midQuarantineEnabled && classification.quarantineTtlSec > 0) {
+        logWarn(EMOJI.zap, `[${directive.provider.toUpperCase()} ${reqId}] Dumb-forwarder mode (${directive.provider.toUpperCase()}_ENABLE_QUARANTINE=false): Key ${currentKeyIndex} quarantine bypassed.`);
+      }
+      const midTtlSec = !midQuarantineEnabled || classification.quarantineTtlSec === 0
+        ? undefined
+        : classification.quarantineTtlSec;
+      logLimit(reqId, directive.provider, currentKeyIndex, 500, midTtlSec, selected.totalKeys, reason);
+
+      if (isSingleFlight) {
+        logWarn(
+          EMOJI.zap,
+          `[${directive.provider.toUpperCase()} ${reqId}] Mid-stream drop occurred. Retries disabled in single-flight mode. Closing stream.`
+        );
+        return null;
+      }
+
+      while (currentAttempt < maxAttempts) {
+        currentAttempt++;
+        if (clientSignal?.aborted) {
+          return null;
+        }
+        const nextSelected = globalKeyPool.selectNextKey(directive.provider);
+        if (!nextSelected) {
+          return null;
+        }
+        logRotate(reqId, directive.provider, currentKeyIndex, nextSelected.index, nextSelected.totalKeys, currentAttempt, maxAttempts);
+        currentKeyIndex = nextSelected.index;
+
+        const nextHeaders = buildAuthHeaders(endpoint.authHeader, nextSelected.key, directive.provider, clientHdrs);
+        const nextFetchOpts: FetcherOptions = {
+          url: endpoint.url,
+          method: "POST",
+          headers: nextHeaders,
+          body: outboundBody,
+          clientSignal,
+          provider: directive.provider,
+          keyIndex: nextSelected.index,
+          model: activePayload.model,
+        };
+
+        await acquireProviderPacer(directive.provider, clientSignal);
+
+        try {
+          const nextResult = await fetchWithTtftGuard(nextFetchOpts);
+          if (nextResult.response.status >= 400) {
+            if (nextResult.response.status === 401 || nextResult.response.status === 403) {
+              try {
+                globalKeyPool.reportFailure(directive.provider, nextSelected.index, nextResult.response.status);
+              } catch (authErr: unknown) {
+                if (!isFatalAuthError(authErr)) throw authErr;
+              }
+              return null;
+            }
+            if (globalKeyPool.isQuarantineEnabled(directive.provider)) {
+              try {
+                globalKeyPool.reportFailure(directive.provider, nextSelected.index, nextResult.response.status);
+              } catch (authErr: unknown) {
+                if (isFatalAuthError(authErr)) return null;
+                throw authErr;
+              }
+            }
+            continue;
+          }
+          globalKeyPool.reportSuccess(directive.provider, nextSelected.index);
+          return {
+            firstChunk: nextResult.firstChunk,
+            rawReader: nextResult.rawReader,
+            reader: nextResult.rawReader,
+          };
+        } catch (fetchErr: unknown) {
+          void fetchErr;
+          if (globalKeyPool.isQuarantineEnabled(directive.provider)) {
+            globalKeyPool.reportFailure(directive.provider, nextSelected.index, 500);
+          }
+          continue;
+        }
+      }
+      return null;
+    },
+  });
+
+  if (isResponses) {
+    resilientStream = resilientStream.pipeThrough(createResponsesStreamTransformer(activePayload.model));
+  } else if (isLing) {
+    resilientStream = resilientStream.pipeThrough(createLingStreamTransformer());
+  } else if (isXmlTranslationActive) {
+    resilientStream = resilientStream.pipeThrough(createDotsStreamTransformer());
+  }
+
+  resilientStream = resilientStream.pipeThrough(createThoughtSignatureStreamTap());
+
+  return new Response(resilientStream, {
+    status: response.status,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
+
+export function wrapStreamWithPacerLease(
+  body: ReadableStream<Uint8Array>,
+  lease: PacerAcquireResult
+): ReadableStream<Uint8Array> {
+  let released = false;
+  const releaseOnce = () => {
+    if (!released) {
+      released = true;
+      lease.release();
+    }
+  };
+
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read();
+        if (done) {
+          releaseOnce();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err: unknown) {
+        releaseOnce();
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      releaseOnce();
+      return reader.cancel(reason);
+    },
+  });
+}
+
+function finalizeAttemptResponse(
+  response: Response,
+  pacerLease: PacerAcquireResult | undefined
+): Response {
+  if (!pacerLease) {
+    return response;
+  }
+  const isStreaming =
+    response.headers.get("content-type")?.includes("text/event-stream") &&
+    response.body !== null;
+  if (isStreaming && response.body) {
+    return new Response(wrapStreamWithPacerLease(response.body, pacerLease), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
+  pacerLease.release();
+  return response;
+}
+
+export async function acquireProviderPacer(
+  provider: string,
+  clientSignal?: AbortSignal
+): Promise<PacerAcquireResult | undefined> {
+  const env = getEnv();
+  if (!env.LITEROUTER_PACER_ENABLED) return undefined;
+  const provConfig = isRegisteredProvider(provider) ? getProviderConfig(provider) : undefined;
+  if (provConfig?.pacer?.enabled === false) return undefined;
+  const pacer = getPacerForProvider(provider);
+  return await pacer.acquire(clientSignal);
+}
+
+export async function waitAndSelectKey(
+  provider: string,
+  startTime: number,
+  maxWaitMs: number,
+  clientSignal?: AbortSignal
+): Promise<SelectedKey | null> {
+  const remainingWait = Math.max(0, maxWaitMs - (Date.now() - startTime));
+  return globalKeyPool.waitForKeyAvailable(provider, remainingWait, clientSignal);
+}
+
+interface AttemptExecutionResult {
+  readonly success: boolean;
+  readonly response?: Response;
+  readonly error?: unknown;
+  readonly retryable: boolean;
+}
+
+async function tryDirectAttempt(
+  directive: DirectDirective,
+  transformed: OpenAIRequestPayload,
+  clientSignal: AbortSignal | undefined,
+  selected: SelectedKey,
+  reqId: string,
+  attempt: number,
+  maxAttempts: number,
+  clientOptions?: RequestClientOptions,
+  startTime?: number
+): Promise<AttemptExecutionResult> {
+  try {
+    const res = await executeDirectCall(directive, transformed, clientSignal, selected, reqId, attempt, maxAttempts, clientOptions);
+    return { success: true, response: res, retryable: false };
+  } catch (err: unknown) {
+    if (clientSignal?.aborted) {
+      return { success: false, error: err, retryable: false };
+    }
+    if (err instanceof Error && err.message.includes("aborted")) {
+      return { success: false, error: err, retryable: false };
+    }
+    if (isFatalAuthError(err)) {
+      return {
+        success: true,
+        response: Response.json(
+          {
+            error: {
+              message: err.message,
+              type: "authentication_error",
+              code: err.status,
+            },
+          },
+          {
+            status: err.status,
+            headers: { "Content-Type": "application/json" },
+          }
+        ),
+        retryable: false,
+      };
+    }
+    if (err instanceof PacerQueueOverflowError) {
+      return {
+        success: true,
+        response: Response.json(
+          {
+            error: {
+              message: err.message,
+              type: "rate_limit_exceeded",
+              code: "rate_limit_exceeded",
+            },
+          },
+          {
+            status: 429,
+            headers: {
+              "Retry-After": String(err.retryAfterSec),
+              "Content-Type": "application/json",
+            },
+          }
+        ),
+        retryable: false,
+      };
+    }
+    if (err instanceof UpstreamRetryableError) {
+      return { success: false, error: err, retryable: true };
+    }
+    if (err instanceof NoResponseError) {
+      const provConfig = isRegisteredProvider(directive.provider)
+        ? getProviderConfig(directive.provider)
+        : undefined;
+      const isSingleFlight = !(provConfig?.request_retry?.enabled ?? true);
+      if (globalKeyPool.isQuarantineEnabled(directive.provider)) {
+        globalKeyPool.reportFailure(directive.provider, selected.index, 0, undefined, err.message, Date.now(), 2);
+      }
+      if (isSingleFlight) {
+        logWarn(EMOJI.zap, `[${directive.provider.toUpperCase()} ${reqId}] Single-flight mode: Upstream transport error: ${err.message}`);
+        logServed(reqId, Date.now() - (startTime ?? Date.now()), 502, attempt, maxAttempts);
+        logSeparator();
+        return {
+          success: true,
+          response: Response.json(
+            {
+              error: {
+                message: `${directive.provider.toUpperCase()} upstream connection failed: ${err.message}`,
+                type: "upstream_connection_error",
+                code: 502,
+              },
+            },
+            {
+              status: 502,
+              headers: { "Content-Type": "application/json" },
+            }
+          ),
+          retryable: false,
+        };
+      }
+      return { success: false, error: err, retryable: true };
+    }
+    logError(reqId, "Direct request error", err);
+    return { success: false, error: err, retryable: false };
+  }
+}
+
+async function executeSingleAttemptLoop(
+  directive: DirectDirective,
+  transformed: OpenAIRequestPayload,
+  clientSignal: AbortSignal | undefined,
+  reqId: string,
+  clientOptions?: RequestClientOptions
+): Promise<Response> {
+  const env = getEnv();
+  const poolSize = globalKeyPool.getPoolSize(directive.provider);
+  const provConfig = isRegisteredProvider(directive.provider)
+    ? getProviderConfig(directive.provider)
+    : undefined;
+  const maxAttempts = provConfig?.request_retry?.enabled
+    ? Math.min(provConfig.request_retry.max_attempts, poolSize > 0 ? poolSize : 1)
+    : 1;
+  let lastError: unknown = null;
+  let prevKeyIndex = -1;
+  const startTime = Date.now();
+  const maxWaitMs = provConfig?.pacer?.max_queue_wait_ms ?? env.LITEROUTER_PACER_MAX_QUEUE_WAIT_MS;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (clientSignal?.aborted) {
+      return Response.json(
+        { error: { message: "Request aborted by client", type: "client_closed_request" } },
+        { status: 499 }
+      );
+    }
+    const dwellMs = Date.now() - startTime;
+    if (globalKeyPool.isQuarantineEnabled(directive.provider) && globalKeyPool.shouldLoadShed(directive.provider, dwellMs, maxWaitMs)) {
+      const minTtl = globalKeyPool.getMinQuarantineTtlMs(directive.provider);
+      const retryAfterSec = Math.max(1, Math.ceil(minTtl / 1000));
+      return Response.json(
+        { error: { message: `Provider '${directive.provider}' unavailable: all keys in cooldown exceed wait budget.`, type: "service_unavailable" } },
+        {
+          status: 503,
+          headers: {
+            "Retry-After": String(retryAfterSec),
+          },
+        }
+      );
+    }
+
+    const shouldPaceIngress = provConfig?.pacer?.enabled ?? false;
+    let pacerLease: PacerAcquireResult | undefined;
+    if (shouldPaceIngress) {
+      try {
+        pacerLease = await acquireProviderPacer(directive.provider, clientSignal);
+      } catch (err: unknown) {
+        if (clientSignal?.aborted || (err instanceof Error && err.message.includes("aborted"))) {
+          return Response.json(
+            { error: { message: "Request aborted by client", type: "client_closed_request" } },
+            { status: 499 }
+          );
+        }
+        if (err instanceof PacerQueueOverflowError) {
+          return Response.json(
+            {
+              error: {
+                message: err.message,
+                type: "rate_limit_exceeded",
+                code: "rate_limit_exceeded",
+              },
+            },
+            {
+              status: 429,
+              headers: {
+                "Retry-After": String(err.retryAfterSec),
+                "Content-Type": "application/json",
+              },
+            }
+          );
+        }
+        throw err;
+      }
+    }
+
+    const selected = await waitAndSelectKey(directive.provider, startTime, maxWaitMs, clientSignal);
+    if (!selected) {
+      pacerLease?.release();
+      if (clientSignal?.aborted) {
+        return Response.json(
+          { error: { message: "Request aborted by client", type: "client_closed_request" } },
+          { status: 499 }
+        );
+      }
+      const minTtl = globalKeyPool.getMinQuarantineTtlMs(directive.provider);
+      logExhausted(reqId, directive.provider, minTtl);
+      return Response.json(
+        { error: { message: `All API keys for provider '${directive.provider}' are cooling down.`, type: "insufficient_quota" } },
+        { status: 429 }
+      );
+    }
+
+    if (attempt > 0) {
+      logRotate(reqId, directive.provider, prevKeyIndex, selected.index, selected.totalKeys, attempt + 1, maxAttempts);
+    }
+    prevKeyIndex = selected.index;
+
+    const outcome = await tryDirectAttempt(directive, transformed, clientSignal, selected, reqId, attempt + 1, maxAttempts, clientOptions, startTime);
+    if (outcome.response && (!outcome.retryable || outcome.response.status === 200)) {
+      return finalizeAttemptResponse(outcome.response, pacerLease);
+    }
+
+    pacerLease?.release();
+    lastError = outcome.error;
+    if (clientSignal?.aborted || (lastError instanceof Error && lastError.message.includes("aborted"))) {
+      return Response.json(
+        { error: { message: "Request aborted by client", type: "client_closed_request" } },
+        { status: 499 }
+      );
+    }
+    if (!outcome.retryable) {
+      if (outcome.response) {
+        return outcome.response;
+      }
+      if (isFatalAuthError(lastError)) {
+        return Response.json(
+          {
+            error: {
+              message: lastError.message,
+              type: "authentication_error",
+              code: lastError.status,
+            },
+          },
+          {
+            status: lastError.status,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+      throw lastError;
+    }
+
+    if (attempt + 1 < maxAttempts && provConfig?.request_retry?.delay) {
+      const { min_ms, max_ms } = provConfig.request_retry.delay;
+      const delayMs = min_ms < max_ms
+        ? min_ms + Math.floor(Math.random() * (max_ms - min_ms + 1))
+        : min_ms;
+      if (delayMs > 0) {
+        await Bun.sleep(delayMs);
+      }
+    }
+  }
+  logError(reqId, "Direct request attempts exhausted", lastError);
+  const errMsg = lastError instanceof Error ? lastError.message : "All direct request attempts failed";
+  const statusCode = lastError instanceof UpstreamRetryableError ? lastError.status : 502;
+  return Response.json(
+    { error: { message: `Direct request attempts exhausted - ${errMsg}`, type: "gateway_error" } },
+    { status: statusCode }
+  );
+}
+
+export async function executeDirectRequest(
+  directive: DirectDirective,
+  body: OpenAIRequestPayload,
+  clientSignal: AbortSignal | undefined,
+  reqId: string,
+  clientOptions?: RequestClientOptions
+): Promise<Response> {
+  let targetBody = body;
+  if ((directive.provider === "or" || (directive.provider as string) === "openrouter") && body.model.startsWith("openrouter/")) {
+    targetBody = {
+      ...body,
+      model: body.model.slice("openrouter/".length),
+    };
+  }
+  const env = getEnv();
+  const transformed = sanitizeAndTransformPayload(targetBody, {
+    nuances: directive.nuances,
+    targetWire: directive.payload,
+    enableScrubbing: env.LITEROUTER_ENABLE_SCRUBBING,
+    globalStripReasoning: env.LITEROUTER_STRIP_REASONING,
+    aoStripReasoning: env.LITEROUTER_AO_STRIP_REASONING,
+  });
+  return executeSingleAttemptLoop(directive, transformed, clientSignal, reqId, clientOptions);
+}
+
+function loadFusionConfig(): FusionConfig {
+  const p = resolve(process.cwd(), "config", "fusion.json");
+  if (!existsSync(p)) {
+    return { version: "3.1", presets: {} };
+  }
+  try {
+    return JSON.parse(readFileSync(p, "utf-8")) as FusionConfig;
+  } catch {
+    return { version: "3.1", presets: {} };
+  }
+}
+
+async function tryExecuteTier(
+  tier: FusionTier,
+  body: OpenAIRequestPayload,
+  clientSignal: AbortSignal | undefined,
+  reqId: string,
+  clientOptions?: RequestClientOptions,
+  tierBudgetMs?: number
+): Promise<{ res: Response; isTerminalError: boolean } | null> {
+  let effectiveSignal = clientSignal;
+  if (tierBudgetMs && tierBudgetMs > 0) {
+    const tierTimeout = AbortSignal.timeout(tierBudgetMs);
+    effectiveSignal = clientSignal
+      ? (typeof AbortSignal.any === "function" ? AbortSignal.any([clientSignal, tierTimeout]) : tierTimeout)
+      : tierTimeout;
+  }
+  const tierDirective = parseDirective(tier.apikey);
+  if (!tierDirective || tierDirective.type !== "direct") {
+    return null;
+  }
+  const tierBody: OpenAIRequestPayload = { ...body, model: tier.model };
+
+  if (tier.overrides && typeof tier.overrides === "object") {
+    Object.assign(tierBody, tier.overrides);
+
+    if (
+      tier.overrides.reasoning_format === "hidden" ||
+      tier.overrides.include_reasoning === false ||
+      tier.overrides.reasoning_effort === "none" ||
+      tier.overrides.reasoning === false
+    ) {
+      if (tier.overrides.reasoning_effort === undefined) {
+        delete (tierBody as Record<string, unknown>).reasoning_effort;
+      }
+      delete (tierBody as Record<string, unknown>).thinking;
+      delete (tierBody as Record<string, unknown>).thinking_config;
+      delete (tierBody as Record<string, unknown>).thinkingConfig;
+    }
+  }
+  if (tierDirective.endpoint === "em") {
+    try {
+      const { executeDispatchPipeline } = await import("../engine/dispatch");
+      const { openAiEmbeddingsTransformer } = await import("../transformers/openai_embeddings");
+      const clientHeaders = clientOptions?.headers instanceof Headers
+        ? clientOptions.headers
+        : new Headers();
+      const outboundPayload = openAiEmbeddingsTransformer.transformClientToWire(
+        tierBody as any,
+        tierDirective,
+        clientHeaders
+      );
+      const dispatchReq = {
+        reqId: `${reqId}_tier${tier.priority}`,
+        method: "POST",
+        path: "/v1/embeddings",
+        directive: tierDirective,
+        rawInboundBody: tierBody,
+        outboundPayload,
+        clientSignal: effectiveSignal ?? new AbortController().signal,
+        clientHeaders,
+        transformer: openAiEmbeddingsTransformer,
+      };
+      const res = await executeDispatchPipeline(dispatchReq);
+      if (res.status === 400 || res.status === 422) {
+        return { res, isTerminalError: true };
+      }
+      return res.status < 400 ? { res, isTerminalError: false } : null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const res = await executeDirectRequest(tierDirective, tierBody, effectiveSignal, reqId, clientOptions);
+    if (res.status === 400 || res.status === 422) {
+      return { res, isTerminalError: true };
+    }
+    return res.status < 400 ? { res, isTerminalError: false } : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function executeFusionFlow(
+  presetName: string,
+  body: OpenAIRequestPayload,
+  clientSignal: AbortSignal | undefined,
+  reqId: string,
+  clientOptions?: RequestClientOptions
+): Promise<Response> {
+  if (clientSignal?.aborted) {
+    return Response.json(
+      { error: { message: "Request aborted by client", type: "client_closed_request" } },
+      { status: 499 }
+    );
+  }
+
+  const engine = getCachedFusionEngine();
+  const plan = engine.createExecutionPlan(presetName, body.model);
+
+  if (!plan || plan.orderedTiers.length === 0) {
+    return Response.json(
+      { error: { message: `No fusion configuration found for model '${body.model}' in preset '${presetName}'.`, type: "invalid_request_error" } },
+      { status: 404 }
+    );
+  }
+
+  const presetConfig = engine.resolvePreset(presetName);
+  const totalBudgetMs = plan.timeoutMs ?? presetConfig?.timeout_ms ?? 45000;
+  const deadline = Date.now() + totalBudgetMs;
+
+  for (const tier of plan.orderedTiers) {
+    if (clientSignal?.aborted) {
+      return Response.json(
+        { error: { message: "Request aborted by client", type: "client_closed_request" } },
+        { status: 499 }
+      );
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      break;
+    }
+    const tierBudgetMs = Math.min(tier.timeout_ms || 15000, remainingMs);
+    const tierResult = await tryExecuteTier(tier, body, clientSignal, reqId, clientOptions, tierBudgetMs);
+
+    if (clientSignal?.aborted) {
+      return Response.json(
+        { error: { message: "Request aborted by client", type: "client_closed_request" } },
+        { status: 499 }
+      );
+    }
+
+    if (tierResult !== null) {
+      if (tierResult.isTerminalError) {
+        return tierResult.res;
+      }
+      if (tierResult.res.status < 400) {
+        engine.handleTierSuccess(presetName, body.model, tier);
+      }
+      return tierResult.res;
+    }
+    engine.handleTierFailure(presetName, body.model, tier);
+  }
+
+  if (clientSignal?.aborted) {
+    return Response.json(
+      { error: { message: "Request aborted by client", type: "client_closed_request" } },
+      { status: 499 }
+    );
+  }
+
+  return Response.json(
+    { error: { message: `All fallback tiers exhausted for model '${body.model}'.`, type: "service_unavailable" } },
+    { status: 503 }
+  );
+}
+
+export interface HandleOptions {
+  readonly customPath?: string;
+  readonly skipInboundLog?: boolean;
+}
+
+export async function handleOpenAICompat(
+  req: Request,
+  rawKey: string,
+  reqId: string,
+  options?: HandleOptions
+): Promise<Response> {
+  const validation = validateDirective(rawKey);
+  if (validation.valid === false) {
+    return createUnauthorizedResponse(validation.error);
+  }
+
+  const directive = validation.directive;
+
+  let body: OpenAIRequestPayload;
+  try {
+    body = (await req.json()) as OpenAIRequestPayload;
+  } catch (err: unknown) {
+    logError(reqId, "Failed to parse JSON body", err);
+    return Response.json({ error: { message: "Malformed JSON body", type: "invalid_request_error" } }, { status: 400 });
+  }
+
+  if (!options?.skipInboundLog) {
+    const path = options?.customPath || new URL(req.url).pathname;
+    const clientAgent = req.headers.get("user-agent") || "unknown";
+    const endpoint = directive.type === "direct"
+      ? resolveUpstreamEndpoint(directive.provider, directive.completion, body.model)
+      : undefined;
+    const providerConfig = directive.type === "direct"
+      ? getProviderEndpointConfig(directive.provider)
+      : undefined;
+    const _conserveRules = providerConfig?.conserve_rules;
+    const poolSize = directive.type === "direct" ? globalKeyPool.getPoolSize(directive.provider) : 1;
+    const refHeaders = endpoint?.headers;
+    const refUa = refHeaders?.["User-Agent"];
+    const refUrl = refHeaders?.["HTTP-Referer"] ?? refHeaders?.["Referer"];
+    const referrer = refUa && refUrl ? `${refUa} @ ${refUrl}` : (refUa ?? refUrl ?? undefined);
+
+    logInbound({
+      reqId,
+      method: req.method,
+      path,
+      clientAgent,
+      protocol: req.headers.get("x-http-version") || "HTTP/1.1",
+      directiveStr: rawKey,
+      targetProvider: directive.type === "direct" ? directive.provider : directive.preset,
+      wireFormat: directive.type === "direct" ? directive.payload : "oa",
+      endpoint: endpoint?.rawPath,
+      model: body.model,
+      totalKeys: poolSize,
+      nuances: directive.type === "direct" ? directive.nuances : undefined,
+      referrer,
+    });
+  }
+
+  let effectiveBody = body;
+  const initialTokens = estimateOpenAITokens(body);
+  if (initialTokens > DEFAULT_MAX_CONTEXT_TOKENS) {
+    effectiveBody = pruneOpenAIPayload(body, DEFAULT_SAFE_CONTEXT_TOKENS);
+    logWarn(EMOJI.prune, `[PRUNE ${reqId}] Proactively pruned OpenAI messages: ${initialTokens} -> ${estimateOpenAITokens(effectiveBody)} tokens.`);
+  }
+
+  const clientOptions: RequestClientOptions = {
+    userAgent: req.headers.get("user-agent") || undefined,
+    headers: req.headers,
+  };
+
+  if (directive.type === "fusion") {
+    return executeFusionFlow(directive.preset, effectiveBody, req.signal, reqId, clientOptions);
+  }
+
+  return executeDirectRequest(directive, effectiveBody, req.signal, reqId, clientOptions);
+}
+
+export {
+  OpenAIChatTransformer,
+  openAiChatTransformer,
+} from "../transformers/openai_chat";

@@ -1,0 +1,301 @@
+{
+  "providers": {
+    "openrouter": {
+      "code": "or",
+      "name": "OpenRouter",
+      "env_key": "OPENROUTER_API_KEYS",
+      "strategy": "standard",
+      "base_url": "https://openrouter.ai",
+      "auth_header": "Bearer",
+      "headers": {
+        "HTTP-Referer": "https://opencode.ai",
+        "X-Title": "OpenCode",
+        "User-Agent": "OpenCode/2.3.2"
+      },
+      "endpoints": {
+        "ch": "/api/v1/chat/completions",
+        "ms": "/api/v1/messages",
+        "em": "/api/v1/embeddings",
+        "md": "/api/v1/models",
+        "rs": "/api/v1/responses"
+      },
+      "conserve_rules": [
+        {
+          "status": 429,
+          "contains": "free-models-per-day",
+          "ttl": "midnight_utc",
+          "reason": "openrouter_daily_free_quota_exhausted"
+        }
+      ],
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 15,
+        "delay": {
+          "min_ms": 1,
+          "max_ms": 10
+        }
+      },
+      "key_cooldown": {
+        "enabled": true,
+        "initial_cooldown_ms": 10000,
+        "max_cooldown_ms": 60000,
+        "reset_after_success": false,
+        "_comment": "initial_cooldown_ms and max_cooldown_ms are declarative/default-only here: they do NOT govern OpenRouter cooldown (only gcp_compat reads them, and calculateCooldownMs has no src caller). OpenRouter key cooldown is driven by Retry-After headers, COOLDOWN_RATE_LIMIT_TTL_SEC, and the 7-day quota TTL."
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 20,
+        "max_delay_ms": 50,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 15000
+      }
+    },
+    "nvidia": {
+      "code": "nv",
+      "name": "NVIDIA NIM",
+      "env_key": "NVIDIA_API_KEYS",
+      "strategy": "standard",
+      "base_url": "https://integrate.api.nvidia.com",
+      "auth_header": "Bearer",
+      "endpoints": {
+        "ch": "/v1/chat/completions",
+        "em": "/v1/embeddings",
+        "md": "/v1/models"
+      },
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 3,
+        "delay": {
+          "min_ms": 150,
+          "max_ms": 300
+        }
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 200,
+        "max_delay_ms": 500,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 15000
+      }
+    },
+    "google": {
+      "code": "gg",
+      "name": "Google AI Studio",
+      "env_key": "GOOGLE_API_KEYS",
+      "strategy": "native_cascade",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "auth_header": "Bearer",
+      "endpoints": {
+        "ob": "/v1beta/openai/chat/completions",
+        "gc": "/v1beta/models/{model}:generateContent",
+        "g1": "/v1/models/{model}:generateContent",
+        "em": "/v1beta/models/{model}:embedContent",
+        "md": "/v1beta/models"
+      },
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 3,
+        "delay": {
+          "min_ms": 200,
+          "max_ms": 500
+        }
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 200,
+        "max_delay_ms": 500,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 15000
+      }
+    },
+    "zen": {
+      "code": "zn",
+      "name": "Zen",
+      "env_key": "ZEN_API_KEYS",
+      "strategy": "zen",
+      "base_url": "https://opencode.ai/zen",
+      "auth_header": "Bearer",
+      "headers": {
+        "HTTP-Referer": "https://opencode.ai",
+        "Referer": "https://opencode.ai",
+        "X-Title": "OpenCode",
+        "User-Agent": "opencode/2.3.2 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2"
+      },
+      "endpoints": {
+        "ch": "/v1/chat/completions",
+        "ms": "/v1/messages",
+        "md": "/v1/models",
+        "rs": "/v1/responses"
+      },
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 5,
+        "delay": {
+          "min_ms": 200,
+          "max_ms": 2000
+        }
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 200,
+        "max_delay_ms": 2000,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 15000,
+        "max_concurrency": 0
+      }
+    },
+    "gcp": {
+      "code": "gc",
+      "name": "Google Cloud (GCP)",
+      "env_key": "GCP_KEYS",
+      "strategy": "gcp_guarded",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "auth_header": "Bearer",
+      "endpoints": {
+        "ch": "/v1beta/openai/chat/completions",
+        "ob": "/v1beta/openai/chat/completions",
+        "gc": "/v1beta/models/{model}:generateContent",
+        "em": "/v1beta/models/{model}:embedContent",
+        "md": "/v1beta/models"
+      },
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 3,
+        "delay": {
+          "min_ms": 200,
+          "max_ms": 500
+        }
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 2000,
+        "max_delay_ms": 3000,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 240000
+      },
+      "key_cooldown": {
+        "enabled": false,
+        "initial_cooldown_ms": 10000,
+        "max_cooldown_ms": 60000,
+        "reset_after_success": true
+      }
+    },
+    "groq": {
+      "code": "gq",
+      "name": "Groq",
+      "env_key": "GROQ_API_KEYS",
+      "strategy": "standard",
+      "base_url": "https://api.groq.com/openai",
+      "auth_header": "Bearer",
+      "endpoints": {
+        "ch": "/v1/chat/completions",
+        "md": "/v1/models"
+      },
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 3,
+        "delay": {
+          "min_ms": 150,
+          "max_ms": 500
+        }
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 300,
+        "max_delay_ms": 500,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 15000
+      }
+    },
+    "tei": {
+      "code": "tei",
+      "name": "Text Embeddings Inference",
+      "env_key": "TEI_API_KEYS",
+      "strategy": "standard",
+      "base_url": "http://127.0.0.1:8002",
+      "auth_header": "Bearer",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "endpoints": {
+        "em": "/v1/embeddings"
+      },
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 3,
+        "delay": {
+          "min_ms": 1,
+          "max_ms": 5
+        }
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 1,
+        "max_delay_ms": 5,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 5000,
+        "max_concurrency": 8
+      }
+    },
+    "teivps": {
+      "code": "teivps",
+      "name": "Text Embeddings Inference (VPS CPU)",
+      "env_key": "TEI_API_KEYS",
+      "strategy": "standard",
+      "base_url": "http://127.0.0.1:8003",
+      "auth_header": "Bearer",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "endpoints": {
+        "em": "/v1/embeddings"
+      },
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 2,
+        "delay": {
+          "min_ms": 150,
+          "max_ms": 500
+        }
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 10,
+        "max_delay_ms": 50,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 5000,
+        "max_concurrency": 8
+      }
+    },
+    "teimac": {
+      "code": "teimac",
+      "name": "Text Embeddings Inference (Mac Mini M1 MPS)",
+      "env_key": "TEI_API_KEYS",
+      "strategy": "standard",
+      "base_url": "http://127.0.0.1:8002",
+      "auth_header": "Bearer",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "endpoints": {
+        "em": "/v1/embeddings"
+      },
+      "request_retry": {
+        "enabled": true,
+        "max_attempts": 2,
+        "delay": {
+          "min_ms": 150,
+          "max_ms": 500
+        }
+      },
+      "pacer": {
+        "enabled": true,
+        "min_delay_ms": 10,
+        "max_delay_ms": 50,
+        "max_queue_depth": 500,
+        "max_queue_wait_ms": 5000,
+        "max_concurrency": 4
+      }
+    }
+  }
+}

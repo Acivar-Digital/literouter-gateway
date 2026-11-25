@@ -1,0 +1,363 @@
+import http2, {
+  type ClientHttp2Session,
+  type ClientHttp2Stream,
+  constants as h2Constants,
+} from "node:http2";
+
+export interface PooledSession {
+  session: ClientHttp2Session;
+  activeStreams: number;
+  origin: string;
+  isDraining: boolean;
+  createdAt?: number;
+  ageTimer?: ReturnType<typeof setTimeout>;
+  drainTimer?: ReturnType<typeof setTimeout>;
+}
+
+export interface Http2PoolConfig {
+  readonly maxStreamsPerSession?: number;
+  readonly sessionsPerOrigin?: number;
+  readonly maxSessionAgeMs?: number;
+  readonly drainTimeoutMs?: number;
+  readonly connectTimeoutMs?: number;
+}
+
+export class Http2SessionPool {
+  private readonly sessions = new Map<string, PooledSession[]>();
+  private readonly connectionLocks = new Map<string, Promise<ClientHttp2Session>>();
+  private readonly maxStreamsPerSession: number;
+  private readonly sessionsPerOrigin: number;
+  private readonly maxSessionAgeMs: number;
+  private readonly drainTimeoutMs: number;
+  private readonly connectTimeoutMs: number;
+
+  constructor(config?: Http2PoolConfig) {
+    this.maxStreamsPerSession = config?.maxStreamsPerSession ?? 80;
+    this.sessionsPerOrigin = config?.sessionsPerOrigin ?? 1;
+    this.maxSessionAgeMs = config?.maxSessionAgeMs ?? 180000;
+    this.drainTimeoutMs = config?.drainTimeoutMs ?? 30000;
+    this.connectTimeoutMs = config?.connectTimeoutMs ?? 10000;
+  }
+
+  public isSessionHealthy(session: ClientHttp2Session): boolean {
+    if (session.closed || session.destroyed || session.connecting) {
+      return false;
+    }
+    const socket = (session as unknown as { socket?: { destroyed?: boolean } }).socket;
+    if (socket && socket.destroyed) {
+      return false;
+    }
+    return true;
+  }
+
+  public purgeSession(poolKey: string, session: ClientHttp2Session): void {
+    const pool = this.sessions.get(poolKey);
+    if (!pool) return;
+    const item = pool.find((p) => p.session === session);
+    if (item) {
+      this.destroySession(poolKey, item);
+    }
+  }
+
+  public async acquireSession(poolKey: string, explicitOrigin?: string): Promise<ClientHttp2Session> {
+    const connectOrigin = explicitOrigin ?? poolKey.split("#")[0] ?? poolKey;
+    const pool = this.sessions.get(poolKey) ?? [];
+
+    // 1. Clean up dead/unhealthy sessions and find existing active, non-draining session
+    const validPool: PooledSession[] = [];
+    for (const item of pool) {
+      if (!this.isSessionHealthy(item.session)) {
+        this.destroySession(poolKey, item);
+        continue;
+      }
+      validPool.push(item);
+      if (!item.isDraining && item.activeStreams < this.maxStreamsPerSession) {
+        item.activeStreams++;
+        return item.session;
+      }
+    }
+
+    // 2. Check if a connection is already in-flight (Single-Flight Mutex with try/catch)
+    const inFlightConnection = this.connectionLocks.get(poolKey);
+    if (inFlightConnection) {
+      try {
+        const session = await inFlightConnection;
+        const item = (this.sessions.get(poolKey) ?? []).find((p) => p.session === session);
+        if (item && !item.isDraining && this.isSessionHealthy(item.session) && item.activeStreams < this.maxStreamsPerSession) {
+          item.activeStreams++;
+          return item.session;
+        }
+      } catch (err) {
+        // Shared flight failed; log and fall through safely to direct creation or fallback
+        console.warn(`[H2 Pool] In-flight connection attempt failed for ${poolKey}, bypassing lock:`, err);
+      }
+    }
+
+    // 3. Spawn new session with Single-Flight Mutex lock if under sessionsPerOrigin
+    const activeNonDraining = validPool.filter((p) => !p.isDraining && this.isSessionHealthy(p.session));
+    if (activeNonDraining.length < this.sessionsPerOrigin) {
+      const connectPromise = this.createSession(poolKey, connectOrigin);
+      this.connectionLocks.set(poolKey, connectPromise);
+
+      try {
+        const session = await connectPromise;
+        const item = (this.sessions.get(poolKey) ?? []).find((p) => p.session === session);
+        if (item) item.activeStreams++;
+        return session;
+      } finally {
+        this.connectionLocks.delete(poolKey);
+      }
+    }
+
+    // 4. Fallback: all sessions are maxed out, but we still need to route traffic.
+    // We create an emergency session. [SRE FIX: Must increment activeStreams!]
+    const emergencySession = await this.createSession(poolKey, connectOrigin);
+    const item = (this.sessions.get(poolKey) ?? []).find((p) => p.session === emergencySession);
+    if (item) {
+      item.activeStreams++;
+    }
+    return emergencySession;
+  }
+
+  /**
+   * Attaches an atomic lifecycle guard to the HTTP/2 stream ensuring releaseStream is guaranteed.
+   */
+  public attachStreamGuard(poolKey: string, session: ClientHttp2Session, stream: ClientHttp2Stream): void {
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      this.releaseStream(poolKey, session);
+    };
+
+    stream.once("close", releaseOnce);
+    stream.once("error", releaseOnce);
+    stream.once("frameError", releaseOnce);
+    stream.once("finish", releaseOnce);
+    // Release on abort only where the stream object supports the signal.
+    if ("aborted" in stream) {
+      stream.once("aborted", releaseOnce);
+    }
+  }
+
+  public releaseStream(poolKey: string, session: ClientHttp2Session): void {
+    const pool = this.sessions.get(poolKey);
+    if (!pool) return;
+    const item = pool.find((p) => p.session === session);
+    if (item && item.activeStreams > 0) {
+      item.activeStreams--;
+      // If session is draining and all active streams finished, clean up immediately
+      if (item.isDraining && item.activeStreams === 0) {
+        this.destroySession(poolKey, item);
+      }
+    }
+  }
+
+  public getSessionStats(poolKey?: string) {
+    if (poolKey) {
+      let sessionCount = 0;
+      let activeSessions = 0;
+      let totalActiveStreams = 0;
+
+      for (const [key, pool] of this.sessions.entries()) {
+        if (key === poolKey || key.startsWith(`${poolKey}#`)) {
+          sessionCount += pool.length;
+          activeSessions += pool.filter((p) => !p.isDraining && !p.session.closed).length;
+          totalActiveStreams += pool.reduce((acc, p) => acc + p.activeStreams, 0);
+        }
+      }
+
+      return {
+        origin: poolKey,
+        sessionCount,
+        activeSessions,
+        totalActiveStreams,
+      };
+    }
+    const allStats: Record<string, { sessionCount: number; activeSessions: number; totalActiveStreams: number }> = {};
+    for (const [key, pool] of this.sessions.entries()) {
+      allStats[key] = {
+        sessionCount: pool.length,
+        activeSessions: pool.filter((p) => !p.isDraining && !p.session.closed).length,
+        totalActiveStreams: pool.reduce((acc, p) => acc + p.activeStreams, 0),
+      };
+    }
+    return allStats;
+  }
+
+  public closeAll(): void {
+    for (const [poolKey, pool] of this.sessions.entries()) {
+      for (const item of pool) {
+        if (item.ageTimer) clearTimeout(item.ageTimer);
+        if (item.drainTimer) clearTimeout(item.drainTimer);
+        try {
+          if (!item.session.closed && !item.session.destroyed) {
+            item.session.destroy();
+          }
+        } catch (err: unknown) {
+          console.debug(`[H2 Pool] Ignored destroy error on closeAll for ${poolKey}:`, err);
+        }
+      }
+    }
+    this.sessions.clear();
+    this.connectionLocks.clear();
+  }
+
+  private startDraining(poolKey: string, item: PooledSession): void {
+    if (item.isDraining) return;
+    item.isDraining = true;
+    if (item.ageTimer) {
+      clearTimeout(item.ageTimer);
+      item.ageTimer = undefined;
+    }
+    if (item.activeStreams === 0) {
+      this.destroySession(poolKey, item);
+      return;
+    }
+    item.drainTimer = setTimeout(() => {
+      if (item.activeStreams > 0) {
+        item.drainTimer = undefined;
+        item.isDraining = false;
+        this.startDraining(poolKey, item);
+      } else {
+        this.destroySession(poolKey, item);
+      }
+    }, this.drainTimeoutMs);
+  }
+
+  private async createSession(poolKey: string, connectOrigin: string): Promise<ClientHttp2Session> {
+    return new Promise<ClientHttp2Session>((resolve, reject) => {
+      let connectTimer: ReturnType<typeof setTimeout> | null = null;
+      let session: ClientHttp2Session;
+
+      try {
+        session = http2.connect(connectOrigin, {
+          // ALPN negotiation happens over TLS
+          timeout: this.connectTimeoutMs,
+        });
+      } catch (err) {
+        return reject(err);
+      }
+
+      const pooled: PooledSession = {
+        session,
+        activeStreams: 0,
+        origin: connectOrigin,
+        isDraining: false,
+        createdAt: Date.now(),
+      };
+
+      const cleanupListeners = () => {
+        if (connectTimer) clearTimeout(connectTimer);
+        session.removeListener("connect", onConnect);
+        session.removeListener("error", onError);
+      };
+
+      const onConnect = () => {
+        cleanupListeners();
+        const pool = this.sessions.get(poolKey) ?? [];
+        pool.push(pooled);
+        this.sessions.set(poolKey, pool);
+
+        // Schedule proactive rotation timer with jitter to prevent simultaneous pool drains
+        if (this.maxSessionAgeMs > 0) {
+          const jitter = (Math.random() - 0.5) * 30000;
+          const ttl = Math.max(10000, this.maxSessionAgeMs + jitter);
+          pooled.ageTimer = setTimeout(() => {
+            this.startDraining(poolKey, pooled);
+          }, ttl);
+        }
+
+        // Attach permanent runtime error and lifecycle listeners to purge zombie sessions
+        session.on("error", (err: Error) => {
+          console.debug(`[H2 Pool] Runtime socket error for ${poolKey}, purging session:`, err?.message || err);
+          this.destroySession(poolKey, pooled);
+        });
+
+        session.on("frameError", (type: number, code: number, id: number) => {
+          console.debug(`[H2 Pool] Frame error (type=${type}, code=${code}, id=${id}) for ${poolKey}, purging session`);
+          this.destroySession(poolKey, pooled);
+        });
+
+        resolve(session);
+      };
+
+      const onError = (err: Error) => {
+        cleanupListeners();
+        this.destroySession(poolKey, pooled);
+        reject(err);
+      };
+
+      connectTimer = setTimeout(() => {
+        cleanupListeners();
+        this.destroySession(poolKey, pooled);
+        reject(new Error(`HTTP/2 connection timeout to origin ${connectOrigin}`));
+      }, this.connectTimeoutMs);
+
+      session.once("connect", onConnect);
+      session.once("error", onError);
+
+      session.on("close", () => this.destroySession(poolKey, pooled));
+
+      // Upstream GOAWAY Handler: Keep session in pool for active stream releases, but mark isDraining
+      session.on("goaway", () => {
+        this.startDraining(poolKey, pooled);
+      });
+    });
+  }
+
+  private destroySession(poolKey: string, item: PooledSession): void {
+    if (item.ageTimer) {
+      clearTimeout(item.ageTimer);
+      item.ageTimer = undefined;
+    }
+    if (item.drainTimer) {
+      clearTimeout(item.drainTimer);
+      item.drainTimer = undefined;
+    }
+    if (!item.session.destroyed && !item.session.closed) {
+      try {
+        if (item.isDraining && item.activeStreams > 0) {
+          if (typeof item.session.close === "function") {
+            item.session.close();
+          }
+        } else if (typeof item.session.destroy === "function") {
+          item.session.destroy();
+        } else if (typeof item.session.close === "function") {
+          item.session.close();
+        }
+      } catch (err: unknown) {
+        console.debug(`[H2 Pool] Ignored destroy error during destroySession for ${poolKey}:`, err);
+      }
+    }
+    this.removeSession(poolKey, item.session);
+  }
+
+  private removeSession(poolKey: string, session: ClientHttp2Session): void {
+    const pool = this.sessions.get(poolKey);
+    if (!pool) return;
+    const filtered = pool.filter((p) => p.session !== session);
+    if (filtered.length === 0) {
+      this.sessions.delete(poolKey);
+    } else {
+      this.sessions.set(poolKey, filtered);
+    }
+  }
+}
+
+// Global HTTP/2 Session Pool singleton
+let globalHttp2Pool: Http2SessionPool | null = null;
+
+export function getHttp2Pool(): Http2SessionPool {
+  if (!globalHttp2Pool) {
+    globalHttp2Pool = new Http2SessionPool();
+  }
+  return globalHttp2Pool;
+}
+
+export function resetHttp2Pool(): void {
+  if (globalHttp2Pool) {
+    globalHttp2Pool.closeAll();
+    globalHttp2Pool = null;
+  }
+}

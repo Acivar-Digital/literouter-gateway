@@ -1,0 +1,3 @@
+[test]
+preload = ["./tests/preload.ts", "./tests/bootstrap_config.ts"]
+pathIgnorePatterns = ["tests/integration/*", "tests/eval/*"]

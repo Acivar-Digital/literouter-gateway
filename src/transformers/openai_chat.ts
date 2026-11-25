@@ -1,0 +1,426 @@
+import type { ParsedDirective } from "../directive/types";
+import type {
+  OutboundWirePayload,
+  PayloadTransformerContract,
+} from "../engine/transformer";
+import type { RequestTelemetry, UsageRecord } from "../telemetry/session";
+import {
+  filterReasoningFromChunk,
+  stripReasoningFromResponseBody,
+} from "./opencode_adapter";
+import { sanitizeAndTransformPayload } from "./payload";
+import type { OpenAIRequestPayload } from "./nuances";
+import { EMOJI, logWarn } from "../ui/logger";
+import { SAFE_CLIENT_PASS_HEADERS } from "../engine/dispatch";
+import {
+  storeThoughtSignature,
+  storeThoughtSignaturesFromResponse,
+} from "./thinking";
+
+interface ParsedUsageDetails {
+  readonly reasoning_tokens?: number;
+  readonly thinking_tokens?: number;
+}
+
+interface RawUsagePayload {
+  readonly prompt_tokens?: number;
+  readonly completion_tokens?: number;
+  readonly total_tokens?: number;
+  readonly input_tokens?: number;
+  readonly output_tokens?: number;
+  readonly completion_tokens_details?: ParsedUsageDetails;
+  readonly output_tokens_details?: ParsedUsageDetails;
+}
+
+interface StreamToolCallAccumulator {
+  id?: string;
+  signature?: string;
+}
+
+interface StreamState {
+  lineBuffer: string;
+  ttftMarked: boolean;
+  usageRecorded: boolean;
+  latestFinishReason: string | null;
+  toolCallsByIndex?: Map<number, StreamToolCallAccumulator>;
+}
+
+function extractDirectiveNuances(directive: ParsedDirective): readonly string[] {
+  return "nuances" in directive ? directive.nuances : [];
+}
+
+function extractDirectiveWire(directive: ParsedDirective): string {
+  if ("payload" in directive) {
+    return directive.wire ?? directive.payload;
+  }
+  return "oa";
+}
+
+function shouldScrubReasoning(directive: ParsedDirective): boolean {
+  const nuances = extractDirectiveNuances(directive);
+  const wire = extractDirectiveWire(directive);
+  if (nuances.includes("ts") || nuances.includes("ds")) {
+    return false;
+  }
+  return wire === "oa" || nuances.includes("sb");
+}
+
+function extractReasoningTokens(usage: RawUsagePayload): number | undefined {
+  const details = usage.completion_tokens_details ?? usage.output_tokens_details;
+  if (!details || typeof details !== "object") {
+    return undefined;
+  }
+  return details.reasoning_tokens ?? details.thinking_tokens;
+}
+
+function parseOpenAiUsage(data: Record<string, unknown>): UsageRecord | null {
+  if (!data.usage || typeof data.usage !== "object") {
+    return null;
+  }
+  const u = data.usage as RawUsagePayload;
+  const promptTokens = u.prompt_tokens ?? u.input_tokens ?? 0;
+  const completionTokens = u.completion_tokens ?? u.output_tokens ?? 0;
+  const totalTokens = u.total_tokens ?? (promptTokens + completionTokens);
+  const reasoningTokens = extractReasoningTokens(u);
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    reasoningTokens,
+  };
+}
+
+function extractFinishReason(data: Record<string, unknown>): string | null {
+  if (!Array.isArray(data.choices) || data.choices.length === 0) {
+    return null;
+  }
+  const choice = data.choices[0] as { finish_reason?: unknown };
+  if (typeof choice?.finish_reason === "string" && choice.finish_reason.length > 0) {
+    return choice.finish_reason;
+  }
+  return null;
+}
+
+function hasContentToken(data: Record<string, unknown>, shouldScrub: boolean): boolean {
+  if (!Array.isArray(data.choices) || data.choices.length === 0) {
+    return false;
+  }
+  const first = data.choices[0] as { delta?: Record<string, unknown> };
+  const delta = first?.delta;
+  if (!delta || typeof delta !== "object") {
+    return false;
+  }
+  if (typeof delta.content === "string" && delta.content.length > 0) {
+    return true;
+  }
+  if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+    return true;
+  }
+  if (!shouldScrub && typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+    return true;
+  }
+  return false;
+}
+
+function recordTelemetryEvents(
+  parsed: Record<string, unknown>,
+  state: StreamState,
+  shouldScrub: boolean,
+  telemetry: RequestTelemetry
+): void {
+  if (!state.ttftMarked && hasContentToken(parsed, shouldScrub)) {
+    state.ttftMarked = true;
+    telemetry.markTtft("openai");
+  }
+
+  const finishReason = extractFinishReason(parsed);
+  if (finishReason) {
+    state.latestFinishReason = finishReason;
+  }
+
+  const usage = parseOpenAiUsage(parsed);
+  if (usage && !state.usageRecorded) {
+    state.usageRecorded = true;
+    telemetry.recordUsage({
+      ...usage,
+      finishReason: state.latestFinishReason,
+    });
+  }
+}
+
+function emitFilteredOrRaw(
+  parsed: Record<string, unknown>,
+  dataStr: string,
+  shouldScrub: boolean,
+  reqId: string | undefined,
+  controller: TransformStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder
+): void {
+  if (!shouldScrub) {
+    controller.enqueue(encoder.encode(`data: ${dataStr}\n\n`));
+    return;
+  }
+
+  const { filteredData, shouldEmit } = filterReasoningFromChunk(parsed, reqId);
+  if (shouldEmit) {
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(filteredData)}\n\n`));
+  }
+}
+
+function recordThoughtSignaturesFromStream(
+  parsed: Record<string, unknown>,
+  state: StreamState
+): void {
+  if (!Array.isArray(parsed.choices)) return;
+  for (const choice of parsed.choices) {
+    if (!choice || typeof choice !== "object") continue;
+    const delta = (choice as Record<string, unknown>).delta as Record<string, unknown> | undefined;
+    if (!delta) continue;
+
+    if (Array.isArray(delta.tool_calls)) {
+      if (!state.toolCallsByIndex) {
+        state.toolCallsByIndex = new Map();
+      }
+      for (const tc of delta.tool_calls) {
+        if (!tc || typeof tc !== "object") continue;
+        const idx = typeof tc.index === "number" ? tc.index : 0;
+        let entry = state.toolCallsByIndex.get(idx);
+        if (!entry) {
+          entry = {};
+          state.toolCallsByIndex.set(idx, entry);
+        }
+        if (typeof tc.id === "string" && tc.id) {
+          entry.id = tc.id;
+          if (entry.id && entry.signature) {
+            storeThoughtSignature(entry.id, entry.signature);
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(delta.reasoning_details)) {
+      for (const item of delta.reasoning_details) {
+        if (!item || typeof item !== "object") continue;
+        const tcId = (item as any).id || (item as any).tool_call_id;
+        const data = (item as any).data || (item as any).signature;
+        if (typeof tcId === "string" && typeof data === "string") {
+          storeThoughtSignature(tcId, data);
+        } else if (typeof data === "string") {
+          const idx = typeof (item as any).index === "number" ? (item as any).index : 0;
+          if (!state.toolCallsByIndex) {
+            state.toolCallsByIndex = new Map();
+          }
+          let entry = state.toolCallsByIndex.get(idx);
+          if (!entry) {
+            entry = {};
+            state.toolCallsByIndex.set(idx, entry);
+          }
+          entry.signature = data;
+          if (entry.id) {
+            storeThoughtSignature(entry.id, data);
+          }
+        }
+      }
+    }
+  }
+}
+
+function handleDataChunk(
+  dataStr: string,
+  state: StreamState,
+  directive: ParsedDirective,
+  telemetry: RequestTelemetry,
+  controller: TransformStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder
+): void {
+  if (dataStr === "[DONE]") {
+    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    return;
+  }
+
+  const shouldScrub = shouldScrubReasoning(directive);
+
+  // Fast-path bypass:
+  // If reasoning scrubbing is disabled, TTFT is already marked, and the chunk contains
+  // neither usage nor finish_reason, nor tool_calls nor reasoning_details, it is a pure mid-stream content delta.
+  // We can pass dataStr directly to the client without JSON.parse / JSON.stringify.
+  if (
+    !shouldScrub &&
+    state.ttftMarked &&
+    !dataStr.includes('"usage"') &&
+    !dataStr.includes('"finish_reason"') &&
+    !dataStr.includes('"tool_calls"') &&
+    !dataStr.includes('"reasoning_details"')
+  ) {
+    controller.enqueue(encoder.encode(`data: ${dataStr}\n\n`));
+    return;
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(dataStr) as Record<string, unknown>;
+  } catch (parseErr) {
+    const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+    logWarn(EMOJI.amber, `Invalid JSON in SSE data line: ${msg}`);
+    controller.enqueue(encoder.encode(`data: ${dataStr}\n\n`));
+    return;
+  }
+
+  recordThoughtSignaturesFromStream(parsed, state);
+  recordTelemetryEvents(parsed, state, shouldScrub, telemetry);
+  emitFilteredOrRaw(parsed, dataStr, shouldScrub, telemetry.reqId, controller, encoder);
+}
+
+function handleLine(
+  rawLine: string,
+  state: StreamState,
+  directive: ParsedDirective,
+  telemetry: RequestTelemetry,
+  controller: TransformStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder
+): void {
+  const line = rawLine.trim();
+  if (line.length === 0) {
+    return;
+  }
+  if (line.startsWith(":")) {
+    controller.enqueue(encoder.encode(`${line}\n\n`));
+    return;
+  }
+  if (line.startsWith("data:")) {
+    const dataStr = line.slice(5).trim();
+    handleDataChunk(dataStr, state, directive, telemetry, controller, encoder);
+    return;
+  }
+  controller.enqueue(encoder.encode(`${line}\n\n`));
+}
+
+export class OpenAIChatTransformer implements PayloadTransformerContract {
+  /** Pure: converts client request body to upstream wire format */
+  transformClientToWire(
+    inboundBody: Record<string, unknown>,
+    directive: ParsedDirective,
+    headers: Headers
+  ): OutboundWirePayload {
+    const isStreaming = Boolean(inboundBody.stream);
+    const wireHeaders: Record<string, string> = {
+      "content-type": "application/json",
+    };
+    if (headers && typeof headers.forEach === "function") {
+      headers.forEach((value, key) => {
+        const lower = key.toLowerCase();
+        if (SAFE_CLIENT_PASS_HEADERS.has(lower)) {
+          wireHeaders[lower] = value;
+        }
+      });
+    }
+
+    const nuances = extractDirectiveNuances(directive);
+    const wire = extractDirectiveWire(directive);
+    let transformedBody = sanitizeAndTransformPayload(
+      inboundBody as OpenAIRequestPayload,
+      {
+        nuances,
+        targetWire: wire as "oa" | "oo" | "cl" | "gg" | "rs" | "ao",
+        enableScrubbing: true,
+      }
+    ) as Record<string, unknown>;
+
+    const providerCode = directive.type === "direct" ? String(directive.provider) : "";
+    if (providerCode === "zn" || providerCode === "zen") {
+      const { adaptZenPayload, scrubZenHeaders } = require("../engine/zen");
+      scrubZenHeaders(wireHeaders);
+      const adapted = adaptZenPayload(transformedBody);
+      transformedBody = adapted.adaptedBody;
+    }
+
+    return {
+      endpointKey: "ch",
+      method: "POST",
+      headers: wireHeaders,
+      body: transformedBody,
+      isStreaming,
+    };
+  }
+
+  /** Pure: converts upstream non-streaming response to client format */
+  transformWireToClient(
+    upstreamJson: unknown,
+    directive: ParsedDirective
+  ): unknown {
+    if (!upstreamJson || typeof upstreamJson !== "object") {
+      return upstreamJson;
+    }
+
+    storeThoughtSignaturesFromResponse(upstreamJson);
+
+    if (shouldScrubReasoning(directive)) {
+      const cloned = structuredClone(upstreamJson) as Record<string, unknown>;
+      stripReasoningFromResponseBody(cloned);
+      return cloned;
+    }
+
+    return upstreamJson;
+  }
+
+  /**
+   * Returns a TransformStream for streaming response translation.
+   * Parses inbound SSE chunks (data: {...}).
+   * Calls telemetry.markTtft() on first content chunk.
+   * Calls telemetry.recordUsage() on final chunk if usage block is present.
+   * Handles reasoning scrubbing per nuance (oa wire scrubs reasoning_content unless ts nuance is present).
+   * Emits standard OpenAI SSE chunks.
+   */
+  createWireToClientStream(
+    directive: ParsedDirective,
+    telemetry: RequestTelemetry,
+    clientSignal: AbortSignal
+  ): TransformStream<Uint8Array, Uint8Array> {
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    const state: StreamState = {
+      lineBuffer: "",
+      ttftMarked: false,
+      usageRecorded: false,
+      latestFinishReason: null,
+    };
+
+    return new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (clientSignal.aborted || chunk.byteLength === 0) {
+          return;
+        }
+        state.lineBuffer += decoder.decode(chunk, { stream: true });
+        const lines = state.lineBuffer.split("\n");
+        state.lineBuffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (clientSignal.aborted) {
+            return;
+          }
+          handleLine(line, state, directive, telemetry, controller, encoder);
+        }
+      },
+
+      flush(controller) {
+        if (clientSignal.aborted) {
+          return;
+        }
+        const remaining = decoder.decode();
+        if (remaining.length > 0) {
+          state.lineBuffer += remaining;
+        }
+        if (state.lineBuffer.trim().length > 0) {
+          const lines = state.lineBuffer.split("\n");
+          state.lineBuffer = "";
+          for (const line of lines) {
+            handleLine(line, state, directive, telemetry, controller, encoder);
+          }
+        }
+      },
+    });
+  }
+}
+
+export const openAiChatTransformer = new OpenAIChatTransformer();

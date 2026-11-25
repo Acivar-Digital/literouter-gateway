@@ -1,0 +1,341 @@
+{
+  "$schema": "./fusion.schema.json",
+  "version": "3.1",
+  "presets": {
+    "quad": {
+      "strategy": "sticky_fallback",
+      "timeout_ms": 30000,
+      "models": {
+        "anthropic/claude-3.7-sonnet": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-or-cl-ms-no",
+              "model": "anthropic/claude-3.7-sonnet"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-an-cl-ms-no",
+              "model": "claude-3-7-sonnet-20250219"
+            }
+          ]
+        },
+        "deepseek/deepseek-r1": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-nv-oa-ch-ts",
+              "model": "deepseek-ai/deepseek-r1"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-or-oa-ch-ts",
+              "model": "deepseek/deepseek-r1"
+            }
+          ]
+        },
+        "gemini-2.5-pro": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-gg-oa-ob-dp",
+              "model": "gemini-2.5-pro"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-or-oa-ch-no",
+              "model": "google/gemini-2.5-pro"
+            }
+          ]
+        }
+      }
+    },
+    "pydn": {
+      "strategy": "sticky_fallback",
+      "timeout_ms": 25000,
+      "models": {
+        "deepseek-reasoner": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-ds-oa-ch-ts",
+              "model": "deepseek-reasoner"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-nv-oa-ch-ts",
+              "model": "deepseek-ai/deepseek-r1"
+            }
+          ]
+        },
+        "claude-3-7-sonnet": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-an-cl-ms-no",
+              "model": "claude-3-7-sonnet-20250219"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-or-cl-ms-no",
+              "model": "anthropic/claude-3.7-sonnet"
+            }
+          ]
+        }
+      }
+    },
+    "fast": {
+      "strategy": "sticky_fallback",
+      "timeout_ms": 15000,
+      "models": {
+        "gemini-3.1-flash-lite": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-gg-oa-ob-dp",
+              "model": "gemini-3.1-flash-lite"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-or-oa-ch-no",
+              "model": "google/gemini-3.1-flash-lite"
+            }
+          ]
+        },
+        "llama-3.3-70b": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-gq-oa-ch-no",
+              "model": "llama-3.3-70b-versatile"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-cb-oa-ch-no",
+              "model": "llama-3.3-70b"
+            }
+          ]
+        }
+      }
+    },
+    "deep": {
+      "strategy": "sticky_fallback",
+      "timeout_ms": 45000,
+      "models": {
+        "deepseek-r1": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-nv-oa-ch-ts",
+              "model": "deepseek-ai/deepseek-r1"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-ds-oa-ch-ts",
+              "model": "deepseek-reasoner"
+            },
+            {
+              "priority": 3,
+              "apikey": "lr-or-oa-ch-ts",
+              "model": "deepseek/deepseek-r1"
+            }
+          ]
+        }
+      }
+    },
+    "safe": {
+      "strategy": "sticky_fallback",
+      "timeout_ms": 30000,
+      "models": {
+        "safe": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-gq-oa-ch-no",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "overrides": {
+                "temperature": 0,
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden"
+              }
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-gq-oa-ch-no",
+              "model": "openai/gpt-oss-20b",
+              "overrides": {
+                "temperature": 0,
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden"
+              }
+            },
+            {
+              "priority": 3,
+              "apikey": "lr-gq-oa-ch-no",
+              "model": "openai/gpt-oss-120b",
+              "overrides": {
+                "temperature": 0,
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden"
+              }
+            },
+            {
+              "priority": 4,
+              "apikey": "lr-or-oa-ch-ts",
+              "model": "@preset/geminiflashlite",
+              "overrides": {
+                "temperature": 0,
+                "reasoning": {
+                  "effort": "minimal",
+                  "enabled": true
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "simple": {
+      "strategy": "sticky_fallback",
+      "timeout_ms": 30000,
+      "models": {
+        "simple": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-gq-oa-ch-no",
+              "model": "qwen/qwen3.8-27b",
+              "overrides": {
+                "temperature": 0,
+                "reasoning_effort": "none",
+                "reasoning_format": "hidden"
+              }
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-gq-oa-ch-no",
+              "model": "openai/gpt-oss-120b",
+              "overrides": {
+                "temperature": 0,
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden"
+              }
+            },
+            {
+              "priority": 3,
+              "apikey": "lr-gq-oa-ch-no",
+              "model": "openai/gpt-oss-20b",
+              "overrides": {
+                "temperature": 0,
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden"
+              }
+            },
+            {
+              "priority": 4,
+              "apikey": "lr-or-oa-ch-ts",
+              "model": "@preset/geminiflashlite",
+              "overrides": {
+                "temperature": 0,
+                "reasoning": {
+                  "effort": "minimal",
+                  "enabled": true
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "embeddings": {
+      "strategy": "sticky_fallback",
+      "timeout_ms": 2500,
+      "models": {
+        "BAAI/bge-m3": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-tei-oa-em-no",
+              "model": "BAAI/bge-m3"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-teimac-oa-em-no",
+              "model": "BAAI/bge-m3"
+            },
+            {
+              "priority": 3,
+              "apikey": "lr-teivps-oa-em-no",
+              "model": "BAAI/bge-m3"
+            }
+          ]
+        },
+        "bge-m3": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-tei-oa-em-no",
+              "model": "BAAI/bge-m3"
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-teimac-oa-em-no",
+              "model": "BAAI/bge-m3"
+            },
+            {
+              "priority": 3,
+              "apikey": "lr-teivps-oa-em-no",
+              "model": "BAAI/bge-m3"
+            }
+          ]
+        }
+      }
+    },
+    "scout": {
+      "strategy": "sticky_fallback",
+      "timeout_ms": 12000,
+      "models": {
+        "scout": {
+          "tiers": [
+            {
+              "priority": 1,
+              "apikey": "lr-or-oa-ch-no",
+              "model": "liquid/lfm-3-1.7b:free",
+              "overrides": {
+                "temperature": 0
+              }
+            },
+            {
+              "priority": 2,
+              "apikey": "lr-or-oa-ch-no",
+              "model": "nvidia/nemotron-3.5-lightning:free",
+              "overrides": {
+                "temperature": 0
+              }
+            },
+            {
+              "priority": 3,
+              "apikey": "lr-or-oa-ch-no",
+              "model": "nvidia/nemotron-3.5-super-vl:free",
+              "overrides": {
+                "temperature": 0
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "native_chains": {
+    "gemini-flash": [
+      "gemini-3.8-flash",
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "gemini-3.5-flash"
+    ],
+    "gemini-flash-lite": [
+      "gemini-3.5-flash-lite",
+      "gemini-3.1-flash-lite"
+    ]
+  }
+}
